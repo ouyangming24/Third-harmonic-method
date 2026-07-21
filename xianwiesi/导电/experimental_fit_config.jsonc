@@ -1,0 +1,94 @@
+{
+  // ======================
+  // 数据文件与列配置
+  // ======================
+  "data": {
+    // 实验数据文件路径
+    "file": "11-4-35um纤维-364mv.xlsx",
+    "columns": {
+      // frequency：频率列名，单位 Hz
+      "frequency": "Frequency (Hz)",
+      // real/imag：3ω电压实部/虚部列名，单位 V，可选 magnitude/phase 组合替代
+      "real": "V3_Real (V)",
+      "imag": "V3_Imag (V)",
+      "phase_unit": "deg" // phase 列单位，deg（度）或 rad（弧度）
+    },
+    "frequency_filter": {
+      // min/max：频率筛选上下限 [Hz]
+      "min": null,
+      "max": null,
+      // start_index/end_index：按排序后索引截取（左闭右开）
+      "start_index": null,
+      "end_index": null,
+      // skip_every：抽样步长，1 表示使用全部点
+      "skip_every": 1
+    }
+  },
+
+  // ======================
+  // 纤维几何与电学参数
+  // ======================
+  "fiber": {
+    "preset": "platinum_wire_20um", // 或 carbon_nanotube_bundle / thin_wire_1um / custom
+    "description": "实验纤维样品",
+    "overrides": {
+      "L_mm": 3.32,        // 电压触点间长度 [mm]
+      "diameter_um": 35, // 直径 [μm]，优先于 area_um2
+      "area_um2": 306.25,    // 横截面积 [μm²]
+      "R": 10.4,           // 电阻 [Ω]
+      "R_prime": 0.01,     // 温度系数 dR/dT [Ω/K]
+      "I_mA": 25.3        // RMS 电流 [mA]
+    }
+  },
+
+  // ======================
+  // 材料初值
+  // ======================
+  "material": {
+    "preset": "platinum", // 或 carbon_nanotube / copper / tungsten / nichrome / custom
+    "overrides": {
+      "kappa": 600, // 热导率 κ [W/(m·K)]
+      "rho": 840,   // 密度 ρ [kg/m³]
+      "C_p": 1030    // 比热容 C_p [J/(kg·K)]
+    }
+  },
+
+  // ======================
+  // 拟合选项
+  // ======================
+  "fitting": {
+    "params_to_fit": [
+      "kappa",
+      "C_p"
+    ],
+    "fit_mode": "phase", // amplitude / phase / both / real / imag
+    "max_iter": 50,     // 最大迭代次数
+    "tolerance": 1e-5,  // 收敛阈值 ε
+    "zeta": 0.5,        // 步长因子 ζ
+    "bounds": {
+      "kappa": [         // κ 边界 [W/(m·K)]
+        0.1,
+        5000
+      ],
+      "C_p": [           // C_p 边界 [J/(kg·K)]
+        50,
+        5000
+      ],
+      "rho": [           // ρ 边界 [kg/m³]
+        100,
+        25000
+      ]
+    }
+  },
+
+  // ======================
+  // 输出控制
+  // ======================
+  "outputs": {
+    "show_plot": false,                       // 是否显示拟合图
+    "save_plot": "results/exp_fit.png",       // 图像输出路径
+    "export_json": "results/exp_fit_summary.json", // 拟合摘要 JSON
+    "export_data": "results/exp_fit_dataset.csv"   // 数据导出 CSV
+  }
+}
+

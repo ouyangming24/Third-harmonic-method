@@ -4524,12 +4524,16 @@ class VisualizationWidget(QWidget):
 
     COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
               '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    # 各拟合参数的 ±20% 曲线配色（按参数序号循环）
+    PM20_PLUS_COLORS = ['#ff7f0e', '#d62728', '#9467bd', '#e377c2', '#8c564b']
+    PM20_MINUS_COLORS = ['#2ca02c', '#17becf', '#bcbd22', '#1f77b4', '#7f7f7f']
 
     def __init__(self):
         super().__init__()
         self.current_data = None
         self.joint_data = None
         self.curve_checkboxes = []
+        self.pm20_checkboxes = []
         self.init_ui()
 
     def init_ui(self):
@@ -4558,7 +4562,7 @@ class VisualizationWidget(QWidget):
         scroll_area.setWidgetResizable(True)
         curve_panel_layout.addWidget(scroll_area)
 
-        self.curve_panel.setMaximumWidth(260)
+        self.curve_panel.setMaximumWidth(280)
         self.curve_panel.setVisible(False)
         main_layout.addWidget(self.curve_panel)
 
@@ -4573,6 +4577,15 @@ class VisualizationWidget(QWidget):
         self.plot_type.setCurrentText("Amplitude")
         self.plot_type.currentTextChanged.connect(self.update_plot_type)
         plot_control.addWidget(self.plot_type)
+
+        self.show_pm20_cb = QCheckBox("显示参数 ±20%")
+        self.show_pm20_cb.setChecked(True)
+        self.show_pm20_cb.setToolTip(
+            "对每个已拟合参数单独 ×1.2 / ×0.8 后重新正演理论曲线；"
+            "左侧可勾选要显示的参数（默认全部）。"
+        )
+        self.show_pm20_cb.toggled.connect(self.refresh_current_plot)
+        plot_control.addWidget(self.show_pm20_cb)
         plot_control.addStretch()
         right_layout.addLayout(plot_control)
 
@@ -4597,29 +4610,167 @@ class VisualizationWidget(QWidget):
         self.save_fig_btn.clicked.connect(self.save_figure)
 
     def _set_all_checkboxes(self, checked):
-        for cb in self.curve_checkboxes:
+        for cb in self.curve_checkboxes + self.pm20_checkboxes:
+            cb.blockSignals(True)
             cb.setChecked(checked)
-        self._redraw_joint()
+            cb.blockSignals(False)
+        self.refresh_current_plot()
 
     def _clear_checkboxes(self):
-        for cb in self.curve_checkboxes:
-            cb.deleteLater()
+        # 清空左侧面板（保留末尾 stretch）
+        while self.checkbox_layout.count() > 1:
+            item = self.checkbox_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
         self.curve_checkboxes = []
+        self.pm20_checkboxes = []
 
-    def plot_joint_fitting_results(self, datasets, layers, title="Joint Fitting Results"):
+    @staticmethod
+    def _param_map_label(p_map):
+        """生成拟合参数显示名（模型层序：L0=基底）。"""
+        ptype = p_map.get('type', 'material')
+        if ptype == 'sensor':
+            return f"sensor.{p_map['prop']}"
+        if ptype == 'thickness_link':
+            return f"H_link(L{p_map['upper_idx']}/L{p_map['lower_idx']})"
+        # JointThermalModelFitter 的 map 无 type 字段
+        if 'layer_idx' in p_map:
+            return f"L{p_map['layer_idx']}.{p_map['prop']}"
+        return str(p_map.get('prop', '?'))
+
+    @staticmethod
+    def _v3_with_param_scale(freqs, b, layers, sensor_params, p_map, factor):
+        """将指定参数乘以 factor 后正演 V3；无法扰动时返回 None。"""
+        layers_p = [dict(l) for l in layers]
+        sensor_p = dict(sensor_params)
+        ptype = p_map.get('type', 'material')
+
+        try:
+            if ptype == 'sensor':
+                val = sensor_p.get(p_map['prop'])
+                if val is None or not np.isfinite(val):
+                    return None
+                sensor_p[p_map['prop']] = float(val) * factor
+            elif ptype == 'thickness_link':
+                Ht = float(p_map['H_total'])
+                h_up = float(layers_p[p_map['upper_idx']]['H']) * factor
+                h_up = float(np.clip(h_up, Ht * 1e-6, Ht * (1.0 - 1e-6)))
+                layers_p[p_map['upper_idx']]['H'] = h_up
+                layers_p[p_map['lower_idx']]['H'] = Ht - h_up
+            else:
+                idx = p_map['layer_idx']
+                prop = p_map['prop']
+                val = layers_p[idx].get(prop)
+                if val is None or not np.isfinite(val):
+                    return None
+                layers_p[idx][prop] = float(val) * factor
+
+            Z = calculate_analytical_Z(freqs, b, layers_p)
+            return convert_Z_to_V3(Z, freqs, b, sensor_p)
+        except Exception:
+            return None
+
+    def _build_pm20_series_single(self, freqs, model_ctx):
+        """单数据集：对每个已拟合参数预计算 ±20% 正演曲线。"""
+        series = []
+        if not model_ctx:
+            return series
+        param_maps = model_ctx.get('param_maps') or []
+        b = model_ctx['b']
+        layers = model_ctx['layers']
+        sensor = model_ctx['sensor_params']
+        for i, p_map in enumerate(param_maps):
+            label = self._param_map_label(p_map)
+            V_plus = self._v3_with_param_scale(freqs, b, layers, sensor, p_map, 1.2)
+            V_minus = self._v3_with_param_scale(freqs, b, layers, sensor, p_map, 0.8)
+            if V_plus is None and V_minus is None:
+                continue
+            series.append({
+                'label': label,
+                'V3_plus': V_plus,
+                'V3_minus': V_minus,
+                'color_plus': self.PM20_PLUS_COLORS[i % len(self.PM20_PLUS_COLORS)],
+                'color_minus': self.PM20_MINUS_COLORS[i % len(self.PM20_MINUS_COLORS)],
+            })
+        return series
+
+    def _build_pm20_series_joint(self, datasets, layers, param_maps):
+        """联合拟合：材料参数共享，对各数据集分别正演。"""
+        series = []
+        if not param_maps:
+            return series
+        for i, p_map in enumerate(param_maps):
+            # 联合拟合 param_map 无 type，按材料处理
+            p = dict(p_map)
+            p.setdefault('type', 'material')
+            label = self._param_map_label(p)
+            per_ds = []
+            any_ok = False
+            for ds in datasets:
+                V_plus = self._v3_with_param_scale(
+                    ds['freqs'], ds['b'], layers, ds['sensor_params'], p, 1.2)
+                V_minus = self._v3_with_param_scale(
+                    ds['freqs'], ds['b'], layers, ds['sensor_params'], p, 0.8)
+                if V_plus is not None or V_minus is not None:
+                    any_ok = True
+                per_ds.append({'V3_plus': V_plus, 'V3_minus': V_minus})
+            if not any_ok:
+                continue
+            series.append({
+                'label': label,
+                'per_ds': per_ds,
+                'color_plus': self.PM20_PLUS_COLORS[i % len(self.PM20_PLUS_COLORS)],
+                'color_minus': self.PM20_MINUS_COLORS[i % len(self.PM20_MINUS_COLORS)],
+            })
+        return series
+
+    def _setup_pm20_checkboxes(self, pm20_series, prefix=""):
+        """左侧面板：每个已拟合参数一对 ±20% 开关（默认全开）。"""
+        if not pm20_series:
+            return
+        hdr = QLabel(prefix or "参数 ±20% 正演:")
+        hdr.setStyleSheet("font-weight: bold; margin-top: 6px;")
+        self.checkbox_layout.insertWidget(self.checkbox_layout.count() - 1, hdr)
+        # 用 QLabel 占位不当作 checkbox；仅 pm20_checkboxes 参与逻辑
+        for item in pm20_series:
+            cb = QCheckBox(f"{item['label']} ±20%")
+            cb.setChecked(True)
+            cb.setStyleSheet(
+                f"color: {item['color_plus']};"
+            )
+            cb.toggled.connect(self.refresh_current_plot)
+            self.checkbox_layout.insertWidget(self.checkbox_layout.count() - 1, cb)
+            self.pm20_checkboxes.append(cb)
+        self.curve_panel.setVisible(True)
+
+    def _selected_pm20_indices(self):
+        if not self.show_pm20_cb.isChecked():
+            return []
+        return [i for i, cb in enumerate(self.pm20_checkboxes) if cb.isChecked()]
+
+    def plot_joint_fitting_results(self, datasets, layers, title="Joint Fitting Results",
+                                   param_maps=None):
         """绘制联合拟合结果，每个数据集的实验值和拟合值各自可开关"""
         self.current_data = None
-        self.joint_data = {'datasets': datasets, 'layers': layers, 'title': title}
-
         self._clear_checkboxes()
 
         computed = []
-        for i, ds in enumerate(datasets):
+        for ds in datasets:
             Z_fit = calculate_analytical_Z(ds['freqs'], ds['b'], layers)
             V3_fit = convert_Z_to_V3(Z_fit, ds['freqs'], ds['b'], ds['sensor_params'])
             computed.append(V3_fit)
 
-        self.joint_data['V3_fitted_list'] = computed
+        pm20_series = self._build_pm20_series_joint(datasets, layers, param_maps or [])
+
+        self.joint_data = {
+            'datasets': datasets,
+            'layers': layers,
+            'title': title,
+            'V3_fitted_list': computed,
+            'pm20_series': pm20_series,
+            'param_maps': param_maps or [],
+        }
 
         for i, ds in enumerate(datasets):
             color = self.COLORS[i % len(self.COLORS)]
@@ -4639,6 +4790,7 @@ class VisualizationWidget(QWidget):
             self.checkbox_layout.insertWidget(self.checkbox_layout.count() - 1, cb_fit)
             self.curve_checkboxes.append(cb_fit)
 
+        self._setup_pm20_checkboxes(pm20_series)
         self.curve_panel.setVisible(True)
         self._redraw_joint()
 
@@ -4652,6 +4804,8 @@ class VisualizationWidget(QWidget):
         datasets = self.joint_data['datasets']
         fitted_list = self.joint_data['V3_fitted_list']
         title = self.joint_data['title']
+        pm20_series = self.joint_data.get('pm20_series') or []
+        sel_pm = self._selected_pm20_indices()
 
         if plot_type in ("Amplitude & Phase", "All (2x2)"):
             if plot_type == "All (2x2)":
@@ -4682,8 +4836,21 @@ class VisualizationWidget(QWidget):
             self._plot_curves_on_axes(
                 axes_map, plot_type, freqs, V3_exp, V3_fit,
                 color, label_exp, label_fit,
-                show_exp=cb_exp.isChecked(), show_fit=cb_fit.isChecked()
+                show_exp=cb_exp.isChecked(), show_fit=cb_fit.isChecked(),
             )
+
+            # 对该数据集叠加选中参数的 ±20% 正演
+            for j in sel_pm:
+                if j >= len(pm20_series):
+                    continue
+                item = pm20_series[j]
+                per = item['per_ds'][i]
+                tag = f"DS{i + 1} {item['label']}"
+                self._plot_pm20_on_axes(
+                    axes_map, plot_type, freqs,
+                    per.get('V3_plus'), per.get('V3_minus'),
+                    item['color_plus'], item['color_minus'], tag,
+                )
 
         for ax in self.figure.get_axes():
             ax.legend(fontsize='small', loc='best')
@@ -4731,7 +4898,8 @@ class VisualizationWidget(QWidget):
                 ax.set_xlabel('Frequency (Hz)')
         else:
             if 'amp' in axes_map:
-                draw_on(axes_map['amp'], np.abs(V3_exp) * 1e3, np.abs(V3_fit) * 1e3, log_x=True, log_y=True)
+                draw_on(axes_map['amp'], np.abs(V3_exp) * 1e3, np.abs(V3_fit) * 1e3,
+                        log_x=True, log_y=True)
                 axes_map['amp'].set_ylabel('|V3| (mV)')
                 axes_map['amp'].set_title('Amplitude')
             if 'pha' in axes_map:
@@ -4750,140 +4918,192 @@ class VisualizationWidget(QWidget):
                 axes_map['im'].set_xlabel('Frequency (Hz)')
                 axes_map['im'].set_title('Imaginary Part')
 
-    def plot_fitting_results(self, freqs, V3_exp, V3_fitted, V3_initial=None, title="Fitting Results"):
-        """绘制单数据集拟合结果"""
+    def _plot_pm20_on_axes(self, axes_map, plot_type, freqs, V3_plus, V3_minus,
+                           color_plus, color_minus, tag):
+        """将某参数 ±20% 正演曲线画到 axes 上（含相位）。"""
+
+        def draw_pair(ax, y_plus, y_minus, log_x=True, log_y=False):
+            plot_fn = ax.loglog if (log_x and log_y) else (ax.semilogx if log_x else ax.plot)
+            if y_plus is not None and np.any(np.isfinite(y_plus)):
+                plot_fn(freqs, y_plus, '--', color=color_plus,
+                        label=f'{tag} +20%', linewidth=1.4, alpha=0.9)
+            if y_minus is not None and np.any(np.isfinite(y_minus)):
+                plot_fn(freqs, y_minus, '--', color=color_minus,
+                        label=f'{tag} -20%', linewidth=1.4, alpha=0.9)
+
+        def y_of(V3, kind):
+            if V3 is None:
+                return None
+            if kind == 'amp':
+                return np.abs(V3) * 1e3
+            if kind == 'pha':
+                return np.angle(V3, deg=True)
+            if kind == 're':
+                return V3.real * 1e3
+            if kind == 'im':
+                return V3.imag * 1e3
+            return None
+
+        if 'single' in axes_map:
+            ax = axes_map['single']
+            if plot_type == "Amplitude":
+                draw_pair(ax, y_of(V3_plus, 'amp'), y_of(V3_minus, 'amp'), True, True)
+            elif plot_type == "Phase":
+                draw_pair(ax, y_of(V3_plus, 'pha'), y_of(V3_minus, 'pha'))
+            elif plot_type == "Real Part":
+                draw_pair(ax, y_of(V3_plus, 're'), y_of(V3_minus, 're'))
+            elif plot_type == "Imaginary Part":
+                draw_pair(ax, y_of(V3_plus, 'im'), y_of(V3_minus, 'im'))
+        else:
+            if 'amp' in axes_map:
+                draw_pair(axes_map['amp'], y_of(V3_plus, 'amp'), y_of(V3_minus, 'amp'), True, True)
+            if 'pha' in axes_map:
+                draw_pair(axes_map['pha'], y_of(V3_plus, 'pha'), y_of(V3_minus, 'pha'))
+            if 're' in axes_map:
+                draw_pair(axes_map['re'], y_of(V3_plus, 're'), y_of(V3_minus, 're'))
+            if 'im' in axes_map:
+                draw_pair(axes_map['im'], y_of(V3_plus, 'im'), y_of(V3_minus, 'im'))
+
+    def plot_fitting_results(self, freqs, V3_exp, V3_fitted, V3_initial=None,
+                             title="Fitting Results", model_ctx=None):
+        """绘制单数据集拟合结果；若提供 model_ctx 则对每个已拟合参数 ±20% 正演。"""
         self.joint_data = None
         self._clear_checkboxes()
-        self.curve_panel.setVisible(False)
+
+        pm20_series = self._build_pm20_series_single(freqs, model_ctx)
 
         self.current_data = {
             'freqs': freqs,
             'V3_exp': V3_exp,
             'V3_fitted': V3_fitted,
             'V3_initial': V3_initial,
-            'title': title
+            'title': title,
+            'model_ctx': model_ctx,
+            'pm20_series': pm20_series,
         }
 
-        self.figure.clear()
+        self._setup_pm20_checkboxes(pm20_series)
+        if not pm20_series:
+            self.curve_panel.setVisible(False)
 
+        self._redraw_single()
+
+    def _redraw_single(self):
+        """按当前选项重绘单数据集拟合图。"""
+        if not self.current_data:
+            return
+
+        freqs = self.current_data['freqs']
+        V3_exp = self.current_data['V3_exp']
+        V3_fitted = self.current_data['V3_fitted']
+        V3_initial = self.current_data.get('V3_initial')
+        title = self.current_data['title']
+        pm20_series = self.current_data.get('pm20_series') or []
+        sel_pm = self._selected_pm20_indices()
+
+        self.figure.clear()
         plot_type = self.plot_type.currentText()
 
+        def add_base_and_pm20(ax, kind):
+            """kind: amp|pha|re|im"""
+            if kind == 'amp':
+                ax.loglog(freqs, np.abs(V3_exp) * 1e3, 'ro', label='Experimental Data', markersize=6)
+                ax.loglog(freqs, np.abs(V3_fitted) * 1e3, 'b-', label='Fitted Model', linewidth=2)
+                if V3_initial is not None:
+                    ax.loglog(freqs, np.abs(V3_initial) * 1e3, 'g--', label='Initial Guess', linewidth=1)
+                for j in sel_pm:
+                    item = pm20_series[j]
+                    if item['V3_plus'] is not None:
+                        ax.loglog(freqs, np.abs(item['V3_plus']) * 1e3, '--',
+                                  color=item['color_plus'], label=f"{item['label']} +20%",
+                                  linewidth=1.5, alpha=0.9)
+                    if item['V3_minus'] is not None:
+                        ax.loglog(freqs, np.abs(item['V3_minus']) * 1e3, '--',
+                                  color=item['color_minus'], label=f"{item['label']} -20%",
+                                  linewidth=1.5, alpha=0.9)
+                ax.set_ylabel('|V3| (mV)')
+            elif kind == 'pha':
+                ax.semilogx(freqs, np.angle(V3_exp, deg=True), 'ro', label='Experimental Data', markersize=6)
+                ax.semilogx(freqs, np.angle(V3_fitted, deg=True), 'b-', label='Fitted Model', linewidth=2)
+                if V3_initial is not None:
+                    ax.semilogx(freqs, np.angle(V3_initial, deg=True), 'g--', label='Initial Guess', linewidth=1)
+                for j in sel_pm:
+                    item = pm20_series[j]
+                    if item['V3_plus'] is not None:
+                        ax.semilogx(freqs, np.angle(item['V3_plus'], deg=True), '--',
+                                    color=item['color_plus'], label=f"{item['label']} +20%",
+                                    linewidth=1.5, alpha=0.9)
+                    if item['V3_minus'] is not None:
+                        ax.semilogx(freqs, np.angle(item['V3_minus'], deg=True), '--',
+                                    color=item['color_minus'], label=f"{item['label']} -20%",
+                                    linewidth=1.5, alpha=0.9)
+                ax.set_ylabel('Phase (deg)')
+            elif kind == 're':
+                ax.semilogx(freqs, V3_exp.real * 1e3, 'ro', label='Experimental Data', markersize=6)
+                ax.semilogx(freqs, V3_fitted.real * 1e3, 'b-', label='Fitted Model', linewidth=2)
+                if V3_initial is not None:
+                    ax.semilogx(freqs, V3_initial.real * 1e3, 'g--', label='Initial Guess', linewidth=1)
+                for j in sel_pm:
+                    item = pm20_series[j]
+                    if item['V3_plus'] is not None:
+                        ax.semilogx(freqs, item['V3_plus'].real * 1e3, '--',
+                                    color=item['color_plus'], label=f"{item['label']} +20%",
+                                    linewidth=1.5, alpha=0.9)
+                    if item['V3_minus'] is not None:
+                        ax.semilogx(freqs, item['V3_minus'].real * 1e3, '--',
+                                    color=item['color_minus'], label=f"{item['label']} -20%",
+                                    linewidth=1.5, alpha=0.9)
+                ax.set_ylabel('Real(V3) (mV)')
+            elif kind == 'im':
+                ax.semilogx(freqs, V3_exp.imag * 1e3, 'ro', label='Experimental Data', markersize=6)
+                ax.semilogx(freqs, V3_fitted.imag * 1e3, 'b-', label='Fitted Model', linewidth=2)
+                if V3_initial is not None:
+                    ax.semilogx(freqs, V3_initial.imag * 1e3, 'g--', label='Initial Guess', linewidth=1)
+                for j in sel_pm:
+                    item = pm20_series[j]
+                    if item['V3_plus'] is not None:
+                        ax.semilogx(freqs, item['V3_plus'].imag * 1e3, '--',
+                                    color=item['color_plus'], label=f"{item['label']} +20%",
+                                    linewidth=1.5, alpha=0.9)
+                    if item['V3_minus'] is not None:
+                        ax.semilogx(freqs, item['V3_minus'].imag * 1e3, '--',
+                                    color=item['color_minus'], label=f"{item['label']} -20%",
+                                    linewidth=1.5, alpha=0.9)
+                ax.set_ylabel('Imag(V3) (mV)')
+            ax.set_xlabel('Frequency (Hz)')
+            ax.legend(fontsize='small')
+            ax.grid(True, which="both", ls="--", alpha=0.3)
+
         if plot_type == "All (2x2)":
-            # 显示所有四个图
             ax1 = self.figure.add_subplot(221)
             ax2 = self.figure.add_subplot(222)
             ax3 = self.figure.add_subplot(223)
             ax4 = self.figure.add_subplot(224)
-
-            # 幅值图
-            ax1.loglog(freqs, np.abs(V3_exp) * 1e3, 'ro', label='Experimental Data', markersize=6)
-            ax1.loglog(freqs, np.abs(V3_fitted) * 1e3, 'b-', label='Fitted Model', linewidth=2)
-            if V3_initial is not None:
-                ax1.loglog(freqs, np.abs(V3_initial) * 1e3, 'g--', label='Initial Guess', linewidth=1)
-            ax1.set_xlabel('Frequency (Hz)')
-            ax1.set_ylabel('|V3| (mV)')
+            add_base_and_pm20(ax1, 'amp')
             ax1.set_title('V3 Amplitude')
-            ax1.legend()
-            ax1.grid(True, which="both", ls="--", alpha=0.3)
-
-            # 相位图
-            ax2.semilogx(freqs, np.angle(V3_exp, deg=True), 'ro', label='Experimental Data', markersize=6)
-            ax2.semilogx(freqs, np.angle(V3_fitted, deg=True), 'b-', label='Fitted Model', linewidth=2)
-            if V3_initial is not None:
-                ax2.semilogx(freqs, np.angle(V3_initial, deg=True), 'g--', label='Initial Guess', linewidth=1)
-            ax2.set_xlabel('Frequency (Hz)')
-            ax2.set_ylabel('Phase (deg)')
+            add_base_and_pm20(ax2, 'pha')
             ax2.set_title('V3 Phase')
-            ax2.legend()
-            ax2.grid(True, which="both", ls="--", alpha=0.3)
-
-            # 实部图
-            ax3.semilogx(freqs, V3_exp.real * 1e3, 'ro', label='Experimental Data', markersize=6)
-            ax3.semilogx(freqs, V3_fitted.real * 1e3, 'b-', label='Fitted Model', linewidth=2)
-            if V3_initial is not None:
-                ax3.semilogx(freqs, V3_initial.real * 1e3, 'g--', label='Initial Guess', linewidth=1)
-            ax3.set_xlabel('Frequency (Hz)')
-            ax3.set_ylabel('Real(V3) (mV)')
+            add_base_and_pm20(ax3, 're')
             ax3.set_title('V3 Real Part')
-            ax3.legend()
-            ax3.grid(True, which="both", ls="--", alpha=0.3)
-
-            # 虚部图
-            ax4.semilogx(freqs, V3_exp.imag * 1e3, 'ro', label='Experimental Data', markersize=6)
-            ax4.semilogx(freqs, V3_fitted.imag * 1e3, 'b-', label='Fitted Model', linewidth=2)
-            if V3_initial is not None:
-                ax4.semilogx(freqs, V3_initial.imag * 1e3, 'g--', label='Initial Guess', linewidth=1)
-            ax4.set_xlabel('Frequency (Hz)')
-            ax4.set_ylabel('Imag(V3) (mV)')
+            add_base_and_pm20(ax4, 'im')
             ax4.set_title('V3 Imaginary Part')
-            ax4.legend()
-            ax4.grid(True, which="both", ls="--", alpha=0.3)
-
         elif plot_type == "Amplitude & Phase":
-            # 双图模式 (幅值 + 相位)
             ax1 = self.figure.add_subplot(211)
             ax2 = self.figure.add_subplot(212, sharex=ax1)
-
-            # 幅值图
-            ax1.loglog(freqs, np.abs(V3_exp) * 1e3, 'ro', label='Experimental Data', markersize=6)
-            ax1.loglog(freqs, np.abs(V3_fitted) * 1e3, 'b-', label='Fitted Model', linewidth=2)
-            if V3_initial is not None:
-                ax1.loglog(freqs, np.abs(V3_initial) * 1e3, 'g--', label='Initial Guess', linewidth=1)
-            ax1.set_ylabel('|V3| (mV)')
+            add_base_and_pm20(ax1, 'amp')
             ax1.set_title('V3 Amplitude')
-            ax1.legend()
-            ax1.grid(True, which="both", ls="--", alpha=0.3)
-
-            # 相位图
-            ax2.semilogx(freqs, np.angle(V3_exp, deg=True), 'ro', label='Experimental Data', markersize=6)
-            ax2.semilogx(freqs, np.angle(V3_fitted, deg=True), 'b-', label='Fitted Model', linewidth=2)
-            if V3_initial is not None:
-                ax2.semilogx(freqs, np.angle(V3_initial, deg=True), 'g--', label='Initial Guess', linewidth=1)
-            ax2.set_xlabel('Frequency (Hz)')
-            ax2.set_ylabel('Phase (deg)')
+            add_base_and_pm20(ax2, 'pha')
             ax2.set_title('V3 Phase')
-            ax2.legend()
-            ax2.grid(True, which="both", ls="--", alpha=0.3)
-
         else:
-            # 显示单个图
             ax = self.figure.add_subplot(111)
-
-            if plot_type == "Amplitude":
-                ax.loglog(freqs, np.abs(V3_exp) * 1e3, 'ro', label='Experimental Data', markersize=8)
-                ax.loglog(freqs, np.abs(V3_fitted) * 1e3, 'b-', label='Fitted Model', linewidth=2.5)
-                if V3_initial is not None:
-                    ax.loglog(freqs, np.abs(V3_initial) * 1e3, 'g--', label='Initial Guess', linewidth=1.5)
-                ax.set_ylabel('|V3| (mV)', fontsize=12)
-                ax.set_title('V3 Amplitude', fontsize=14)
-
-            elif plot_type == "Phase":
-                ax.semilogx(freqs, np.angle(V3_exp, deg=True), 'ro', label='Experimental Data', markersize=8)
-                ax.semilogx(freqs, np.angle(V3_fitted, deg=True), 'b-', label='Fitted Model', linewidth=2.5)
-                if V3_initial is not None:
-                    ax.semilogx(freqs, np.angle(V3_initial, deg=True), 'g--', label='Initial Guess', linewidth=1.5)
-                ax.set_ylabel('Phase (deg)', fontsize=12)
-                ax.set_title('V3 Phase', fontsize=14)
-
-            elif plot_type == "Real Part":
-                ax.semilogx(freqs, V3_exp.real * 1e3, 'ro', label='Experimental Data', markersize=8)
-                ax.semilogx(freqs, V3_fitted.real * 1e3, 'b-', label='Fitted Model', linewidth=2.5)
-                if V3_initial is not None:
-                    ax.semilogx(freqs, V3_initial.real * 1e3, 'g--', label='Initial Guess', linewidth=1.5)
-                ax.set_ylabel('Real(V3) (mV)', fontsize=12)
-                ax.set_title('V3 Real Part', fontsize=14)
-
-            elif plot_type == "Imaginary Part":
-                ax.semilogx(freqs, V3_exp.imag * 1e3, 'ro', label='Experimental Data', markersize=8)
-                ax.semilogx(freqs, V3_fitted.imag * 1e3, 'b-', label='Fitted Model', linewidth=2.5)
-                if V3_initial is not None:
-                    ax.semilogx(freqs, V3_initial.imag * 1e3, 'g--', label='Initial Guess', linewidth=1.5)
-                ax.set_ylabel('Imag(V3) (mV)', fontsize=12)
-                ax.set_title('V3 Imaginary Part', fontsize=14)
-
-            ax.set_xlabel('Frequency (Hz)', fontsize=12)
-            ax.legend(fontsize=11)
-            ax.grid(True, which="both", ls="--", alpha=0.3)
+            kind_map = {
+                "Amplitude": 'amp',
+                "Phase": 'pha',
+                "Real Part": 're',
+                "Imaginary Part": 'im',
+            }
+            add_base_and_pm20(ax, kind_map.get(plot_type, 'amp'))
+            ax.set_title(f'V3 {plot_type}', fontsize=14)
 
         self.figure.suptitle(title, fontsize=16)
         self.figure.tight_layout()
@@ -4891,20 +5111,21 @@ class VisualizationWidget(QWidget):
 
     def update_plot_type(self):
         """更新图表类型"""
+        self.refresh_current_plot()
+
+    def refresh_current_plot(self):
+        """按当前选项重绘已有拟合结果（不重新正演）。"""
         if self.joint_data:
             self._redraw_joint()
         elif self.current_data:
-            self.plot_fitting_results(
-                self.current_data['freqs'],
-                self.current_data['V3_exp'],
-                self.current_data['V3_fitted'],
-                self.current_data['V3_initial'],
-                self.current_data['title']
-            )
+            self._redraw_single()
 
     def refresh_plot(self):
-        """刷新图表（需要从其他窗口获取数据）"""
-        QMessageBox.information(self, "提示", "请在拟合完成后查看结果")
+        """刷新图表"""
+        if self.joint_data or self.current_data:
+            self.refresh_current_plot()
+        else:
+            QMessageBox.information(self, "提示", "请在拟合完成后查看结果")
 
     def save_figure(self):
         """保存图表"""
@@ -5060,13 +5281,17 @@ class ThermalMeasurementGUI(QMainWindow):
             if is_joint:
                 if not fitter.datasets:
                     return
+                param_maps = [dict(p) for p in getattr(fitter, '_param_map', [])]
                 self.viz_widget.plot_joint_fitting_results(
                     fitter.datasets, fitter.layers,
-                    title=f"Joint Fit ({len(fitter.datasets)} datasets)"
+                    title=f"Joint Fit ({len(fitter.datasets)} datasets)",
+                    param_maps=param_maps,
                 )
                 self.tabs.setCurrentWidget(self.viz_widget)
+                n_p = len(param_maps)
                 self.status_bar.showMessage(
-                    f"联合拟合完成 (共 {len(fitter.datasets)} 个数据集)，可在左侧面板切换曲线显示"
+                    f"联合拟合完成 (共 {len(fitter.datasets)} 个数据集)，"
+                    f"已对 {n_p} 个拟合参数分别 ±20% 正演"
                 )
             else:
                 # 单数据集拟合
@@ -5076,12 +5301,23 @@ class ThermalMeasurementGUI(QMainWindow):
                 Z_fitted = calculate_analytical_Z(freqs, fitter.b, fitter.layers)
                 V3_fitted = convert_Z_to_V3(Z_fitted, freqs, fitter.b, fitter.sensor_params)
 
+                param_maps = [dict(p) for p in getattr(fitter, '_param_map', [])]
+                model_ctx = {
+                    'b': fitter.b,
+                    'layers': [dict(l) for l in fitter.layers],
+                    'sensor_params': dict(fitter.sensor_params),
+                    'param_maps': param_maps,
+                }
+
                 self.viz_widget.plot_fitting_results(
                     freqs, V3_exp, V3_fitted,
-                    title=f"Fitting Results ({self.fitting_widget.fit_method.currentText()})"
+                    title=f"Fitting Results ({self.fitting_widget.fit_method.currentText()})",
+                    model_ctx=model_ctx,
                 )
                 self.tabs.setCurrentWidget(self.viz_widget)
-                self.status_bar.showMessage("拟合完成，结果已显示在可视化页面")
+                self.status_bar.showMessage(
+                    f"拟合完成，已对 {len(param_maps)} 个拟合参数分别 ±20% 正演"
+                )
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"显示拟合结果时出错:\n{str(e)}")
