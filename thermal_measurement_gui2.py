@@ -20,6 +20,52 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 
+
+def _configure_matplotlib_chinese_font():
+    """为 matplotlib 图例/标题配置可显示中文的字体（Windows 优先微软雅黑）。"""
+    from matplotlib import font_manager
+    candidates = [
+        'Microsoft YaHei',
+        'SimHei',
+        'SimSun',
+        'KaiTi',
+        'FangSong',
+        'PingFang SC',
+        'Noto Sans CJK SC',
+        'Source Han Sans SC',
+        'Arial Unicode MS',
+    ]
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    chosen = None
+    for name in candidates:
+        if name in available:
+            chosen = name
+            break
+    if chosen is None:
+        # 按常见 Windows 字体文件路径再试一次
+        win_paths = [
+            r'C:\Windows\Fonts\msyh.ttc',
+            r'C:\Windows\Fonts\msyh.ttf',
+            r'C:\Windows\Fonts\simhei.ttf',
+            r'C:\Windows\Fonts\simsun.ttc',
+        ]
+        for path in win_paths:
+            if os.path.isfile(path):
+                try:
+                    font_manager.fontManager.addfont(path)
+                    prop = font_manager.FontProperties(fname=path)
+                    chosen = prop.get_name()
+                    break
+                except Exception:
+                    continue
+    if chosen:
+        plt.rcParams['font.sans-serif'] = [chosen] + list(plt.rcParams.get('font.sans-serif', []))
+    plt.rcParams['axes.unicode_minus'] = False  # 负号用 ASCII，避免变成方框
+    return chosen
+
+
+_MATPLOTLIB_CN_FONT = _configure_matplotlib_chinese_font()
+
 # 导入项目模块
 from olson_model26_3 import (
     ThermalModelFitter, JointThermalModelFitter, calculate_analytical_Z, convert_Z_to_V3,
@@ -119,14 +165,25 @@ class SensorDatabase:
 class TemperatureCalculatorDialog(QDialog):
     """温升计算器 (集成原温升计算.py功能)"""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, sensor_params=None):
         super().__init__(parent)
         self.setWindowTitle("3ω温升计算器")
-        self.resize(500, 600)
+        self.resize(500, 620)
+        self._fitting_source = None
         self.init_ui()
+        if sensor_params:
+            self.apply_sensor_params(sensor_params)
 
     def init_ui(self):
         layout = QVBoxLayout()
+
+        sync_row = QHBoxLayout()
+        self.sync_btn = QPushButton("从数据拟合同步传感器参数")
+        self.sync_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; }")
+        self.sync_btn.setToolTip("读取「数据拟合」页当前传感器参数并填入下方初值")
+        self.sync_btn.clicked.connect(self.sync_from_fitting)
+        sync_row.addWidget(self.sync_btn)
+        layout.addLayout(sync_row)
 
         # 1. 传感器参数
         sensor_group = QGroupBox("传感器参数")
@@ -138,6 +195,7 @@ class TemperatureCalculatorDialog(QDialog):
 
         sensor_layout.addWidget(QLabel("温度系数 α_R (/K):"), 1, 0)
         self.alpha_input = QLineEdit("0.0022")
+        self.alpha_input.setToolTip("相对温度系数 α_R = (dR/dT) / R；由拟合页 dR_dT 与 R 换算")
         sensor_layout.addWidget(self.alpha_input, 1, 1)
 
         sensor_layout.addWidget(QLabel("线长 L (mm):"), 2, 0)
@@ -155,6 +213,7 @@ class TemperatureCalculatorDialog(QDialog):
         drive_group = QGroupBox("驱动参数")
         drive_layout = QFormLayout()
         self.v_drive_input = QLineEdit("400")
+        self.v_drive_input.setToolTip("默认同步拟合页 V_rms（换算为 mV）")
         drive_layout.addRow("驱动电压 V (mV):", self.v_drive_input)
         drive_group.setLayout(drive_layout)
         layout.addWidget(drive_group)
@@ -188,6 +247,51 @@ class TemperatureCalculatorDialog(QDialog):
         layout.addWidget(self.result_area)
 
         self.setLayout(layout)
+
+    def set_fitting_source(self, fitting_widget):
+        self._fitting_source = fitting_widget
+
+    def apply_sensor_params(self, sensor_params):
+        """用拟合页传感器参数（SI）填充温升计算器初值。"""
+        if not sensor_params:
+            return
+        try:
+            R = float(sensor_params.get('R', self.r_input.text()))
+            self.r_input.setText(f"{R:.6g}")
+
+            if 'dR_dT' in sensor_params and R != 0:
+                alpha_R = float(sensor_params['dR_dT']) / R
+                self.alpha_input.setText(f"{alpha_R:.6g}")
+
+            if 'L' in sensor_params:
+                self.l_input.setText(f"{float(sensor_params['L']) * 1e3:.6g}")
+
+            if 'b' in sensor_params:
+                # 拟合页 b 为半宽 (m) → 线宽 2b (μm)
+                self.width_input.setText(f"{2.0 * float(sensor_params['b']) * 1e6:.6g}")
+
+            if 'V_rms' in sensor_params:
+                self.v_drive_input.setText(f"{float(sensor_params['V_rms']) * 1e3:.6g}")
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+    def sync_from_fitting(self):
+        src = self._fitting_source
+        if src is None and self.parent() is not None:
+            src = getattr(self.parent(), 'fitting_widget', None)
+        if src is None or not hasattr(src, 'sensor_inputs'):
+            QMessageBox.warning(self, "提示", "未关联数据拟合页，无法同步。")
+            return
+        try:
+            sp = {k: float(inp.text()) for k, inp in src.sensor_inputs.items()}
+            self.apply_sensor_params(sp)
+            self.result_area.append(
+                f"\n已从数据拟合同步: R={sp.get('R')}, "
+                f"dR/dT={sp.get('dR_dT')}, L={sp.get('L')}, b={sp.get('b')}, "
+                f"V_rms={sp.get('V_rms')}\n"
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "同步失败", f"读取传感器参数失败:\n{e}")
 
     def calculate(self):
         try:
@@ -4519,6 +4623,491 @@ class FittingWidget(QWidget):
                 QMessageBox.critical(self, "错误", f"导出失败:\n{str(e)}")
 
 
+# --- 穿透深度 / 线热源近似分析 ---
+def thermal_penetration_depth(alpha, freq_hz):
+    """热穿透深度 δ = √(α / (4π f))，f 为电频率 (Hz)。"""
+    f = np.asarray(freq_hz, dtype=float)
+    out = np.full_like(f, np.nan, dtype=float)
+    valid = (f > 0) & np.isfinite(alpha) & (alpha > 0)
+    out[valid] = np.sqrt(alpha / (4.0 * np.pi * f[valid]))
+    return out
+
+
+def freq_from_penetration_depth(alpha, delta):
+    """由穿透深度反推电频率：f = α / (4π δ²)。"""
+    if not np.isfinite(alpha) or alpha <= 0 or not np.isfinite(delta) or delta <= 0:
+        return np.nan
+    return alpha / (4.0 * np.pi * delta ** 2)
+
+
+class PenetrationAnalysisWidget(QWidget):
+    """穿透深度与线热源近似分析：判断当前频率是否合适并给出建议范围。"""
+
+    def __init__(self):
+        super().__init__()
+        self._fitting_source = None
+        self.material_db = MaterialDatabase()
+        self.sensor_db = SensorDatabase()
+        self.layer_widgets = []
+        self.last_result = None
+        self.init_ui()
+
+    def set_fitting_source(self, fitting_widget):
+        self._fitting_source = fitting_widget
+
+    def init_ui(self):
+        main = QHBoxLayout(self)
+
+        # ---- 左侧参数 ----
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setMinimumWidth(340)
+        left_scroll.setMaximumWidth(420)
+        left_w = QWidget()
+        left = QVBoxLayout(left_w)
+
+        sync_row = QHBoxLayout()
+        self.sync_btn = QPushButton("从数据拟合同步参数")
+        self.sync_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; }")
+        self.sync_btn.clicked.connect(self.sync_from_fitting)
+        sync_row.addWidget(self.sync_btn)
+        left.addLayout(sync_row)
+
+        # 传感器
+        sensor_group = QGroupBox("传感器参数")
+        sensor_layout = QGridLayout()
+        self.sensor_combo = QComboBox()
+        self.sensor_combo.addItems(self.sensor_db.get_sensor_names())
+        self.sensor_combo.currentTextChanged.connect(self._load_sensor_preset)
+        sensor_layout.addWidget(QLabel("预设:"), 0, 0)
+        sensor_layout.addWidget(self.sensor_combo, 0, 1)
+        self.sensor_inputs = {}
+        for i, p in enumerate(['b', 'L', 'R', 'dR_dT', 'V_rms', 'H_e', 'rho_C_e']):
+            sensor_layout.addWidget(QLabel(p), i + 1, 0)
+            inp = QLineEdit()
+            self.sensor_inputs[p] = inp
+            sensor_layout.addWidget(inp, i + 1, 1)
+        sensor_group.setLayout(sensor_layout)
+        left.addWidget(sensor_group)
+        self._load_sensor_preset(self.sensor_combo.currentText())
+
+        # 材料层
+        layer_group = QGroupBox("材料层（顶层→基底，最后一层为基底）")
+        layer_v = QVBoxLayout()
+        self.layer_layout = QVBoxLayout()
+        layer_v.addLayout(self.layer_layout)
+        layer_btn_row = QHBoxLayout()
+        add_btn = QPushButton("添加层")
+        add_btn.clicked.connect(lambda: self._add_layer_ui(len(self.layer_widgets)))
+        rem_btn = QPushButton("删除顶层")
+        rem_btn.clicked.connect(self._remove_top_layer)
+        layer_btn_row.addWidget(add_btn)
+        layer_btn_row.addWidget(rem_btn)
+        layer_v.addLayout(layer_btn_row)
+        layer_group.setLayout(layer_v)
+        left.addWidget(layer_group)
+        self._add_layer_ui(0)
+        self._add_layer_ui(1)
+
+        # 判据与当前频率
+        crit_group = QGroupBox("判据与待评估频率")
+        crit = QFormLayout()
+        self.line_factor = QDoubleSpinBox()
+        self.line_factor.setRange(1.0, 50.0)
+        self.line_factor.setValue(5.0)
+        self.line_factor.setDecimals(1)
+        self.line_factor.setToolTip("线热源近似：要求 δ ≥ N·b（Cahill 常用 N=5，斜率误差约 1%）")
+        crit.addRow("线热源因子 N (δ≥N·b):", self.line_factor)
+
+        self.sub_factor = QDoubleSpinBox()
+        self.sub_factor.setRange(1.0, 50.0)
+        self.sub_factor.setValue(5.0)
+        self.sub_factor.setDecimals(1)
+        self.sub_factor.setToolTip("半无限基底近似：要求 δ ≤ H_sub/N（常用 N=5）")
+        crit.addRow("基底因子 M (δ≤H/M):", self.sub_factor)
+
+        self.eval_fmin = QLineEdit("1")
+        self.eval_fmax = QLineEdit("1000")
+        crit.addRow("当前扫频下限 f_min (Hz):", self.eval_fmin)
+        crit.addRow("当前扫频上限 f_max (Hz):", self.eval_fmax)
+        crit_group.setLayout(crit)
+        left.addWidget(crit_group)
+
+        self.analyze_btn = QPushButton("开始分析")
+        self.analyze_btn.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-size: 14px; padding: 8px; }"
+        )
+        self.analyze_btn.clicked.connect(self.run_analysis)
+        left.addWidget(self.analyze_btn)
+
+        self.apply_lockin_btn = QPushButton("将建议范围写入锁相扫频")
+        self.apply_lockin_btn.setEnabled(False)
+        self.apply_lockin_btn.setToolTip("把建议 f_min / f_max 填入「锁相控制」页的频率起止（若已关联主窗口）")
+        self.apply_lockin_btn.clicked.connect(self.apply_to_lockin)
+        left.addWidget(self.apply_lockin_btn)
+
+        left.addStretch()
+        left_scroll.setWidget(left_w)
+        main.addWidget(left_scroll)
+
+        # ---- 右侧：报告 + 图 ----
+        right = QVBoxLayout()
+        self.report = QTextEdit()
+        self.report.setReadOnly(True)
+        self.report.setFont(QFont("Consolas", 10))
+        self.report.setMinimumHeight(220)
+        right.addWidget(self.report, 1)
+
+        self.figure = Figure(figsize=(8, 4.5))
+        self.canvas = FigureCanvas(self.figure)
+        right.addWidget(self.canvas, 2)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        right.addWidget(self.toolbar)
+
+        main.addLayout(right, 1)
+
+    def _load_sensor_preset(self, name):
+        sens = self.sensor_db.get_sensor(name)
+        for k, inp in self.sensor_inputs.items():
+            if k in sens:
+                inp.setText(f"{sens[k]:.6g}")
+
+    def _add_layer_ui(self, idx):
+        box = QGroupBox(f"第 {idx} 层" + (" (基底)" if False else ""))
+        lay = QGridLayout()
+        combo = QComboBox()
+        combo.addItems(self.material_db.get_material_names())
+        lay.addWidget(QLabel("材料:"), 0, 0)
+        lay.addWidget(combo, 0, 1)
+        inputs = {}
+        for i, p in enumerate(['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']):
+            lay.addWidget(QLabel(p), i + 1, 0)
+            inp = QLineEdit()
+            inputs[p] = inp
+            lay.addWidget(inp, i + 1, 1)
+        box.setLayout(lay)
+
+        def on_mat(text, inps=inputs):
+            mat = self.material_db.get_material(text)
+            for k, v in mat.items():
+                if k in inps:
+                    inps[k].setText("inf" if np.isinf(v) else f"{v:.6g}")
+
+        combo.currentTextChanged.connect(on_mat)
+        on_mat(combo.currentText())
+
+        self.layer_layout.addWidget(box)
+        self.layer_widgets.append({'box': box, 'combo': combo, 'inputs': inputs})
+        self._refresh_layer_titles()
+
+    def _remove_top_layer(self):
+        if len(self.layer_widgets) <= 1:
+            QMessageBox.warning(self, "提示", "至少保留一层。")
+            return
+        w = self.layer_widgets.pop(0)
+        w['box'].deleteLater()
+        self._refresh_layer_titles()
+
+    def _refresh_layer_titles(self):
+        n = len(self.layer_widgets)
+        for i, w in enumerate(self.layer_widgets):
+            tag = " (基底)" if i == n - 1 else (" (顶层)" if i == 0 else "")
+            w['box'].setTitle(f"第 {i} 层{tag}")
+
+    def sync_from_fitting(self):
+        if self._fitting_source is None:
+            QMessageBox.warning(self, "提示", "未关联数据拟合模块。")
+            return
+        try:
+            config = self._fitting_source.get_model_config()
+            sensor = config.get('sensor', {})
+            for k, v in sensor.items():
+                if k in self.sensor_inputs:
+                    self.sensor_inputs[k].setText(str(v))
+
+            layers = config.get('layers', [])
+            while self.layer_widgets:
+                w = self.layer_widgets.pop()
+                w['box'].deleteLater()
+            if not layers:
+                self._add_layer_ui(0)
+            else:
+                for i, layer in enumerate(layers):
+                    self._add_layer_ui(i)
+                    for p, val in layer.items():
+                        if p in self.layer_widgets[i]['inputs']:
+                            self.layer_widgets[i]['inputs'][p].setText(str(val))
+
+            # 若拟合页已有数据频率，填入评估范围
+            fd = getattr(self._fitting_source, 'fitting_data', None)
+            if fd is not None and len(fd) > 0:
+                try:
+                    freqs = fd.iloc[:, 0].values.astype(float)
+                    freqs = freqs[np.isfinite(freqs) & (freqs > 0)]
+                    if len(freqs):
+                        self.eval_fmin.setText(f"{float(np.min(freqs)):.6g}")
+                        self.eval_fmax.setText(f"{float(np.max(freqs)):.6g}")
+                except Exception:
+                    pass
+
+            QMessageBox.information(
+                self, "同步成功",
+                f"已同步传感器与 {len(self.layer_widgets)} 层材料参数。"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "同步失败", str(e))
+
+    def _parse_layers(self):
+        layers = []
+        for w in self.layer_widgets:
+            layer = {}
+            for p, inp in w['inputs'].items():
+                t = inp.text().strip().lower()
+                if t in ('inf', 'infinity'):
+                    layer[p] = np.inf
+                else:
+                    layer[p] = float(t)
+            layers.append(layer)
+        return layers
+
+    def run_analysis(self):
+        try:
+            b = float(self.sensor_inputs['b'].text())
+            if b <= 0:
+                raise ValueError("半线宽 b 必须 > 0")
+
+            layers = self._parse_layers()
+            if not layers:
+                raise ValueError("请至少设置一层材料")
+
+            N = float(self.line_factor.value())
+            M = float(self.sub_factor.value())
+            f_lo = float(self.eval_fmin.text())
+            f_hi = float(self.eval_fmax.text())
+            if f_lo <= 0 or f_hi <= 0 or f_hi < f_lo:
+                raise ValueError("请检查当前扫频上下限（需 >0 且 f_max≥f_min）")
+
+            # 基底 = 最后一层
+            sub = layers[-1]
+            alpha_sub = sub['k_y'] / (sub['rho'] * sub['cap'])
+            H_sub = sub['H']
+
+            # 线热源：δ ≥ N·b → f ≤ f_max_line
+            delta_line = N * b
+            f_max_line = freq_from_penetration_depth(alpha_sub, delta_line)
+
+            # 半无限：δ ≤ H_sub/M → f ≥ f_min_semi
+            if np.isfinite(H_sub) and H_sub > 0:
+                delta_semi = H_sub / M
+                f_min_semi = freq_from_penetration_depth(alpha_sub, delta_semi)
+            else:
+                delta_semi = np.inf
+                f_min_semi = 0.0
+
+            # 建议窗口
+            f_rec_min = f_min_semi
+            f_rec_max = f_max_line
+            window_ok = np.isfinite(f_rec_max) and (f_rec_min < f_rec_max)
+
+            # 各薄膜层特征频率（δ = H）
+            film_info = []
+            for i, layer in enumerate(layers[:-1]):
+                alpha_i = layer['k_y'] / (layer['rho'] * layer['cap'])
+                H_i = layer['H']
+                if np.isfinite(H_i) and H_i > 0 and alpha_i > 0:
+                    f_H = freq_from_penetration_depth(alpha_i, H_i)
+                    film_info.append({
+                        'idx': i, 'alpha': alpha_i, 'H': H_i, 'f_H': f_H,
+                        'k_y': layer['k_y'],
+                    })
+
+            # 评估当前扫频两端
+            def judge_freq(f):
+                delta = float(thermal_penetration_depth(alpha_sub, f))
+                line_ok = delta >= delta_line
+                if np.isfinite(H_sub) and H_sub > 0:
+                    semi_ok = delta <= delta_semi
+                else:
+                    semi_ok = True  # 半无限基底无下界约束
+                return delta, line_ok, semi_ok
+
+            d_lo, line_lo, semi_lo = judge_freq(f_lo)
+            d_hi, line_hi, semi_hi = judge_freq(f_hi)
+
+            # 在区间内均匀抽若干点检查是否都落在建议窗
+            probe = np.logspace(np.log10(f_lo), np.log10(f_hi), 21)
+            in_window = np.ones_like(probe, dtype=bool)
+            if window_ok:
+                in_window &= (probe >= f_rec_min) & (probe <= f_rec_max)
+            elif np.isfinite(f_rec_max):
+                in_window &= (probe <= f_rec_max)
+            frac_ok = float(np.mean(in_window)) if len(probe) else 0.0
+
+            self.last_result = {
+                'alpha_sub': alpha_sub, 'b': b, 'H_sub': H_sub,
+                'N': N, 'M': M, 'delta_line': delta_line, 'delta_semi': delta_semi,
+                'f_max_line': f_max_line, 'f_min_semi': f_min_semi,
+                'f_rec_min': f_rec_min, 'f_rec_max': f_rec_max,
+                'window_ok': window_ok, 'film_info': film_info,
+                'f_lo': f_lo, 'f_hi': f_hi,
+            }
+            self.apply_lockin_btn.setEnabled(window_ok and np.isfinite(f_rec_max))
+
+            # ---- 文本报告 ----
+            lines = []
+            lines.append("=" * 56)
+            lines.append("  3ω 穿透深度 / 线热源近似分析")
+            lines.append("=" * 56)
+            lines.append("")
+            lines.append("【公式】")
+            lines.append("  α = k_y / (ρ · c)")
+            lines.append("  δ(f) = √(α / (4π f))   （电频率 f，热波频率 2ω）")
+            lines.append(f"  线热源近似: δ ≥ {N:g}·b  →  f ≤ α / (4π ({N:g}b)²)")
+            lines.append(f"  半无限基底: δ ≤ H_sub/{M:g} →  f ≥ α / (4π (H_sub/{M:g})²)")
+            lines.append("")
+            lines.append("【基底 / 传感器】")
+            lines.append(f"  半线宽 b = {b * 1e6:.4g} μm")
+            lines.append(f"  基底 α_sub = {alpha_sub:.4e} m²/s")
+            if np.isfinite(H_sub):
+                lines.append(f"  基底厚度 H_sub = {H_sub * 1e6:.4g} μm")
+            else:
+                lines.append("  基底厚度 H_sub = ∞ （半无限，无下界频率约束）")
+            lines.append(f"  线热源临界穿透 δ_line = {N:g}·b = {delta_line * 1e6:.4g} μm")
+            if np.isfinite(delta_semi):
+                lines.append(f"  半无限临界穿透 δ_semi = H/{M:g} = {delta_semi * 1e6:.4g} μm")
+            lines.append("")
+            lines.append("【建议频率窗口（基于基底 α）】")
+            if window_ok:
+                lines.append(f"  ✅ 建议范围: {f_rec_min:.4g} Hz  ≤  f  ≤  {f_rec_max:.4g} Hz")
+                lines.append(f"     (约 {f_rec_min:.3e} ~ {f_rec_max:.3e} Hz)")
+            else:
+                lines.append("  ❌ 不存在同时满足两判据的频率窗口")
+                lines.append(f"     半无限下界 f_min = {f_min_semi:.4g} Hz")
+                lines.append(f"     线热源上界 f_max = {f_max_line:.4g} Hz")
+                if np.isfinite(H_sub) and H_sub > 0:
+                    lines.append(f"     H_sub/b = {H_sub / b:.3g}；若过小则斜率法难同时满足两条件")
+                lines.append("     建议：加宽加热线、加厚基底，或改用全模型拟合（本软件多层模型）")
+            lines.append("")
+
+            if film_info:
+                lines.append("【薄膜特征频率】δ = H 时 f = α/(4π H²)")
+                for fi in film_info:
+                    lines.append(
+                        f"  层{fi['idx']}: H={fi['H']*1e6:.4g} μm, α={fi['alpha']:.3e} m²/s"
+                        f"  →  f_H ≈ {fi['f_H']:.4g} Hz"
+                    )
+                lines.append("  （扫频宜覆盖各层 f_H 附近，薄膜信息才更敏感）")
+                lines.append("")
+
+            lines.append("【当前扫频评估】")
+            lines.append(f"  设定范围: {f_lo:.4g} ~ {f_hi:.4g} Hz")
+            lines.append(f"  @ f_min={f_lo:.4g} Hz:  δ={d_lo*1e6:.4g} μm")
+            lines.append(f"      线热源: {'✅ OK' if line_lo else '❌ 偏高频(δ过小)'}"
+                         f"   半无限: {'✅ OK' if semi_lo else '❌ 偏低频(δ过大)'}")
+            lines.append(f"  @ f_max={f_hi:.4g} Hz:  δ={d_hi*1e6:.4g} μm")
+            lines.append(f"      线热源: {'✅ OK' if line_hi else '❌ 偏高频(δ过小)'}"
+                         f"   半无限: {'✅ OK' if semi_hi else '❌ 偏低频(δ过大)'}")
+            lines.append(f"  区间内落在建议窗的比例: {frac_ok*100:.0f}%")
+
+            overall = line_lo and line_hi and semi_lo and semi_hi and (frac_ok >= 0.9)
+            lines.append("")
+            if overall and window_ok:
+                lines.append("【总评】✅ 当前频率范围整体合适。")
+            elif window_ok:
+                lines.append("【总评】⚠️ 当前频率部分不合适，建议改用上方建议窗口。")
+                # 给出裁剪建议
+                new_lo = max(f_lo, f_rec_min)
+                new_hi = min(f_hi, f_rec_max)
+                if new_lo < new_hi:
+                    lines.append(f"  → 与当前范围的交集: {new_lo:.4g} ~ {new_hi:.4g} Hz")
+                else:
+                    lines.append(f"  → 建议直接改为: {f_rec_min:.4g} ~ {f_rec_max:.4g} Hz")
+            else:
+                lines.append("【总评】❌ 几何/物性下无经典斜率法安全窗；请用本软件全模型拟合，并谨慎选频。")
+
+            lines.append("")
+            lines.append("注: 上述判据针对「斜率法 / 线热源 + 半无限基底」近似；")
+            lines.append("    本软件 Olson 多层模型可在更宽频段工作，但仍建议 δ 与结构尺度可比。")
+
+            self.report.setPlainText("\n".join(lines))
+            self._plot_analysis(alpha_sub, b, H_sub, N, M, f_lo, f_hi,
+                                f_rec_min, f_rec_max, window_ok, film_info)
+
+        except Exception as e:
+            self.report.setPlainText(f"分析失败:\n{e}")
+            traceback.print_exc()
+            QMessageBox.warning(self, "分析失败", str(e))
+
+    def _plot_analysis(self, alpha_sub, b, H_sub, N, M, f_lo, f_hi,
+                       f_rec_min, f_rec_max, window_ok, film_info):
+        # 确保中文字体仍生效（其它模块可能改过 rcParams）
+        _configure_matplotlib_chinese_font()
+
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+
+        # 绘图频率跨度
+        f_plot_min = min(f_lo, f_rec_min if f_rec_min > 0 else f_lo) / 10
+        f_plot_max = max(f_hi, f_rec_max if np.isfinite(f_rec_max) else f_hi) * 10
+        f_plot_min = max(f_plot_min, 1e-4)
+        freqs = np.logspace(np.log10(f_plot_min), np.log10(f_plot_max), 300)
+        delta = thermal_penetration_depth(alpha_sub, freqs) * 1e6  # μm
+
+        ax.loglog(freqs, delta, 'b-', lw=2, label='δ(f) substrate')
+
+        # 判据水平线
+        ax.axhline(N * b * 1e6, color='#ff7f0e', ls='--', lw=1.5,
+                   label=f'Line source: {N:g}·b = {N*b*1e6:.3g} μm')
+        if np.isfinite(H_sub) and H_sub > 0:
+            ax.axhline(H_sub / M * 1e6, color='#2ca02c', ls='--', lw=1.5,
+                       label=f'Semi-inf: H/{M:g} = {H_sub/M*1e6:.3g} μm')
+            ax.axhline(H_sub * 1e6, color='#2ca02c', ls=':', lw=1, alpha=0.7,
+                       label=f'H_sub = {H_sub*1e6:.3g} μm')
+
+        # 建议频率窗
+        if window_ok:
+            ax.axvspan(f_rec_min, f_rec_max, color='#4CAF50', alpha=0.15, label='Recommended band')
+
+        # 当前扫频
+        ax.axvspan(f_lo, f_hi, color='#2196F3', alpha=0.12, label='Current sweep')
+
+        # 薄膜 H 标记
+        for fi in film_info:
+            ax.axhline(fi['H'] * 1e6, color='#9467bd', ls=':', alpha=0.5)
+            if np.isfinite(fi['f_H']) and fi['f_H'] > 0:
+                ax.axvline(fi['f_H'], color='#9467bd', ls=':', alpha=0.5)
+                ax.plot([fi['f_H']], [fi['H'] * 1e6], 'D', color='#9467bd',
+                        label=f"Layer{fi['idx']} δ=H")
+
+        ax.set_xlabel('Frequency f (Hz)')
+        ax.set_ylabel('Penetration depth δ (μm)')
+        ax.set_title('Thermal penetration depth vs frequency')
+        ax.grid(True, which='both', ls='--', alpha=0.3)
+        ax.legend(fontsize='small', loc='best')
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def apply_to_lockin(self):
+        """将建议频率写入锁相页（由主窗口注入回调）。"""
+        if not self.last_result or not self.last_result.get('window_ok'):
+            QMessageBox.warning(self, "提示", "没有有效的建议频率范围。")
+            return
+        cb = getattr(self, '_apply_freq_callback', None)
+        if cb is None:
+            QMessageBox.information(
+                self, "建议范围",
+                f"f_min = {self.last_result['f_rec_min']:.6g} Hz\n"
+                f"f_max = {self.last_result['f_rec_max']:.6g} Hz\n\n"
+                "（未关联锁相写入接口，请手动填写）"
+            )
+            return
+        try:
+            cb(self.last_result['f_rec_min'], self.last_result['f_rec_max'])
+            QMessageBox.information(self, "已写入", "建议频率范围已写入锁相扫频设置。")
+        except Exception as e:
+            QMessageBox.warning(self, "写入失败", str(e))
+
+
 class VisualizationWidget(QWidget):
     """结果可视化界面"""
 
@@ -5195,6 +5784,9 @@ class ThermalMeasurementGUI(QMainWindow):
         self.sensitivity_widget = SensitivityWidget()
         self.tabs.addTab(self.sensitivity_widget, "🎯 灵敏度分析")
 
+        self.penetration_widget = PenetrationAnalysisWidget()
+        self.tabs.addTab(self.penetration_widget, "📐 穿透深度分析")
+
         self.data_comparison_widget = DataComparisonWidget()
         self.tabs.addTab(self.data_comparison_widget, "📈 数据对比")
 
@@ -5218,6 +5810,8 @@ class ThermalMeasurementGUI(QMainWindow):
         )
         self.simulation_widget.set_fitting_source(self.fitting_widget)
         self.sensitivity_widget.set_fitting_source(self.fitting_widget)
+        self.penetration_widget.set_fitting_source(self.fitting_widget)
+        self.penetration_widget._apply_freq_callback = self._apply_recommended_freqs
 
     def create_menu_bar(self):
         menubar = self.menuBar()
@@ -5251,6 +5845,10 @@ class ThermalMeasurementGUI(QMainWindow):
         sensitivity_action.triggered.connect(self.show_temp_calculator)
         tools_menu.addAction(sensitivity_action)
 
+        penetration_action = QAction('穿透深度分析', self)
+        penetration_action.triggered.connect(self.show_penetration_analysis)
+        tools_menu.addAction(penetration_action)
+
         calibration_action = QAction('传感器校准', self)
         tools_menu.addAction(calibration_action)
 
@@ -5265,9 +5863,36 @@ class ThermalMeasurementGUI(QMainWindow):
         help_menu.addAction(about_action)
 
     def show_temp_calculator(self):
-        """显示温升计算器"""
-        dialog = TemperatureCalculatorDialog(self)
+        """显示温升计算器（初值取自数据拟合页当前传感器参数）"""
+        sensor_params = None
+        try:
+            sensor_params = {
+                k: float(inp.text())
+                for k, inp in self.fitting_widget.sensor_inputs.items()
+            }
+        except Exception:
+            sensor_params = None
+
+        dialog = TemperatureCalculatorDialog(self, sensor_params=sensor_params)
+        dialog.set_fitting_source(self.fitting_widget)
         dialog.exec_()
+
+    def show_penetration_analysis(self):
+        """切换到穿透深度分析标签页"""
+        self.tabs.setCurrentWidget(self.penetration_widget)
+        self.status_bar.showMessage("穿透深度 / 线热源近似分析")
+
+    def _apply_recommended_freqs(self, f_min, f_max):
+        """将建议频率写入锁相控制页扫频起止。"""
+        lo = max(0.1, float(f_min))
+        hi = max(lo, float(f_max))
+        # QDoubleSpinBox 有范围上限
+        hi = min(hi, self.lockin_widget.freq_end.maximum())
+        lo = min(lo, hi)
+        self.lockin_widget.freq_start.setValue(lo)
+        self.lockin_widget.freq_end.setValue(hi)
+        self.tabs.setCurrentWidget(self.lockin_widget)
+        self.status_bar.showMessage(f"已写入锁相扫频: {lo:.4g} ~ {hi:.4g} Hz")
 
     def on_fitting_completed(self):
         """拟合完成后的处理"""
@@ -5334,6 +5959,7 @@ class ThermalMeasurementGUI(QMainWindow):
             <li>多层材料热物性参数拟合</li>
             <li>正向模型模拟与分析</li>
             <li>灵敏度分析</li>
+            <li>穿透深度 / 线热源近似分析</li>
             <li>温升计算工具</li>
         </ul>
         <p><b>开发者:</b> 热物性测量实验室</p>
