@@ -53,6 +53,7 @@ def _configure_matplotlib_chinese_font():
             if os.path.isfile(path):
                 try:
                     font_manager.fontManager.addfont(path)
+
                     prop = font_manager.FontProperties(fname=path)
                     chosen = prop.get_name()
                     break
@@ -75,6 +76,10 @@ from calibration_gui import CalibrationWidget
 from signal_calibration import SignalCalibrator
 from 苏黎世锁相适配3 import ZurichLockInControl
 from oe1300_lockin import OE1300LockInControl
+from balance_resistor import (
+    BalanceResistorController, list_serial_ports, SERIAL_AVAILABLE as BALANCE_SERIAL_AVAILABLE,
+)
+from auto_balance import AutoBalanceThread, AutoBalanceConfig
 
 # 扫频时每个频点的滤波时间常数 τ = TC_FACTOR / f(Hz)，苏黎世 demods timeconstant 与 OE1300 OFLT 共用此关系
 LOCKIN_TC_FACTOR = 5.0
@@ -82,6 +87,169 @@ LOCKIN_TC_FACTOR = 5.0
 # OE1300 多次 SNAP 默认（与此前程序内写死值一致）
 OE1300_SNAP_SAMPLES_DEFAULT = 6
 OE1300_SNAP_DURATION_DEFAULT = 1.2
+
+# 测量/模拟数据工作簿中附带模型参数的工作表名
+MODEL_SHEET_DATA = "Data"
+MODEL_SHEET_SENSOR = "Sensor"
+MODEL_SHEET_LAYERS = "Layers"
+MODEL_SHEET_META = "Meta"
+LAYER_PARAM_KEYS = ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']
+# 界面传感器参数：用相对温度系数 α_R；模型内部仍用 dR_dT = α_R · R
+SENSOR_UI_PARAMS = ['b', 'L', 'R', 'alpha_R', 'V_rms', 'H_e', 'rho_C_e']
+SENSOR_UI_LABELS = [
+    '半宽度 b (m)', '长度 L (m)', '电阻 R (Ω)', 'α_R (/K)',
+    'RMS 电压 (V)', '加热器厚度 H_e (m)', 'ρC_e (J/m³K)',
+]
+
+
+def _as_float_param(v):
+    if isinstance(v, str):
+        v = v.strip()
+        if not v:
+            raise ValueError("空参数")
+        if v.lower() == 'inf':
+            return np.inf
+    return float(v)
+
+
+def sensor_dict_for_ui(sensor):
+    """配置/模型字典 → 界面字典（含 alpha_R）。旧数据仅有 dR_dT 时自动换算 α=R'/R。"""
+    if not sensor:
+        return {}
+    out = {}
+    for k, v in sensor.items():
+        if k in ('dR_dT', 'alpha_R'):
+            continue
+        out[k] = v
+    has_alpha = 'alpha_R' in sensor and str(sensor.get('alpha_R', '')).strip() != ''
+    has_drdt = 'dR_dT' in sensor and str(sensor.get('dR_dT', '')).strip() != ''
+    if has_alpha:
+        out['alpha_R'] = sensor['alpha_R']
+    elif has_drdt and 'R' in sensor:
+        R = _as_float_param(sensor['R'])
+        if R == 0:
+            raise ValueError("电阻 R 为 0，无法由 dR_dT 换算 α_R")
+        out['alpha_R'] = _as_float_param(sensor['dR_dT']) / R
+    return out
+
+
+def sensor_dict_for_model(sensor):
+    """界面/配置字典 → 模型用字典（含 dR_dT，不含 alpha_R）。"""
+    if not sensor:
+        raise ValueError("传感器参数为空")
+    out = {}
+    for k, v in sensor.items():
+        if k in ('alpha_R', 'dR_dT'):
+            continue
+        out[k] = _as_float_param(v)
+    if 'R' not in out:
+        raise ValueError("传感器参数缺少 R")
+    R = out['R']
+    has_alpha = 'alpha_R' in sensor and str(sensor.get('alpha_R', '')).strip() != ''
+    has_drdt = 'dR_dT' in sensor and str(sensor.get('dR_dT', '')).strip() != ''
+    if has_alpha:
+        out['dR_dT'] = _as_float_param(sensor['alpha_R']) * R
+    elif has_drdt:
+        out['dR_dT'] = _as_float_param(sensor['dR_dT'])
+    else:
+        raise ValueError("传感器参数缺少 alpha_R 或 dR_dT")
+    return out
+
+
+def map_sensor_fit_ui_to_model(param, lo, hi, R):
+    """界面拟合参数/边界 → 模型键与边界（alpha_R → dR_dT）。"""
+    if param == 'alpha_R':
+        return 'dR_dT', (float(lo) * float(R), float(hi) * float(R))
+    return param, (float(lo), float(hi))
+
+
+def save_dataframe_with_model_config(filename, data_df, model_config=None):
+    """
+    保存数据表；若提供 model_config 且为 .xlsx，则同时写入 Sensor / Layers / Meta 工作表。
+    model_config: {
+      'sensor': {param: value},
+      'layers': [{param: value}, ...],
+      'frequency_range': {'min_hz': ..., 'max_hz': ...},  # 可选
+    }
+    """
+    path = str(filename)
+    cfg = model_config or {}
+    sensor = cfg.get('sensor') or {}
+    layers = cfg.get('layers') or []
+    freq_range = cfg.get('frequency_range') or {}
+    want_meta = bool(sensor or layers or freq_range) and path.lower().endswith(('.xlsx', '.xlsm'))
+
+    if not want_meta:
+        if path.lower().endswith(('.xlsx', '.xlsm')):
+            data_df.to_excel(path, index=False)
+        else:
+            data_df.to_csv(path, index=False)
+        return False
+
+    with pd.ExcelWriter(path, engine='openpyxl') as writer:
+        data_df.to_excel(writer, sheet_name=MODEL_SHEET_DATA, index=False)
+        if sensor:
+            sens_df = pd.DataFrame(
+                [{'param': k, 'value': v} for k, v in sensor.items()]
+            )
+            sens_df.to_excel(writer, sheet_name=MODEL_SHEET_SENSOR, index=False)
+        if layers:
+            rows = []
+            for i, layer in enumerate(layers):
+                row = {'layer': i + 1}
+                for p in LAYER_PARAM_KEYS:
+                    if p in layer:
+                        row[p] = layer[p]
+                rows.append(row)
+            pd.DataFrame(rows).to_excel(writer, sheet_name=MODEL_SHEET_LAYERS, index=False)
+        if freq_range:
+            meta_rows = [{'param': k, 'value': v} for k, v in freq_range.items()]
+            pd.DataFrame(meta_rows).to_excel(writer, sheet_name=MODEL_SHEET_META, index=False)
+    return True
+
+
+def load_dataframe_with_model_config(filename):
+    """
+    读取数据文件；若为含 Sensor/Layers/Meta 的工作簿则一并返回配置。
+    返回 (DataFrame, model_config|None)。
+    """
+    path = str(filename)
+    config = None
+    if path.lower().endswith(('.xlsx', '.xlsm')):
+        xl = pd.ExcelFile(path)
+        sheets = set(xl.sheet_names)
+        # 优先 Data 表；否则第一张（兼容旧单表文件）
+        data_sheet = MODEL_SHEET_DATA if MODEL_SHEET_DATA in sheets else xl.sheet_names[0]
+        df = pd.read_excel(xl, sheet_name=data_sheet)
+        sensor = {}
+        layers = []
+        freq_range = {}
+        if MODEL_SHEET_SENSOR in sheets:
+            sdf = pd.read_excel(xl, sheet_name=MODEL_SHEET_SENSOR)
+            if 'param' in sdf.columns and 'value' in sdf.columns:
+                for _, row in sdf.iterrows():
+                    sensor[str(row['param'])] = row['value']
+        if MODEL_SHEET_LAYERS in sheets:
+            ldf = pd.read_excel(xl, sheet_name=MODEL_SHEET_LAYERS)
+            for _, row in ldf.iterrows():
+                layer = {}
+                for p in LAYER_PARAM_KEYS:
+                    if p in ldf.columns and pd.notna(row.get(p)):
+                        layer[p] = row[p]
+                if layer:
+                    layers.append(layer)
+        if MODEL_SHEET_META in sheets:
+            mdf = pd.read_excel(xl, sheet_name=MODEL_SHEET_META)
+            if 'param' in mdf.columns and 'value' in mdf.columns:
+                for _, row in mdf.iterrows():
+                    freq_range[str(row['param'])] = row['value']
+        if sensor or layers or freq_range:
+            config = {'sensor': sensor, 'layers': layers}
+            if freq_range:
+                config['frequency_range'] = freq_range
+    else:
+        df = pd.read_csv(path)
+    return df, config
 
 
 class EmittingStream(QObject):
@@ -132,26 +300,27 @@ class MaterialDatabase:
 
 
 class SensorDatabase:
-    """传感器配置数据库"""
+    """传感器配置数据库（界面用 α_R；模型内部再换成 dR_dT=α_R·R）"""
 
     def __init__(self):
+        # alpha_R = 原 dR_dT / R
         self.sensors = {
-            '大传感器D1 (300μm)': {'b': 300e-6, 'L': 9e-3, 'R': 5.985, 'dR_dT': 0.0094, 'V_rms': 0.264, 'H_e': 100e-9,
-                                   'rho_C_e': 2.5116e6},
-            '大传感器D2 (250μm)': {'b': 250e-6, 'L': 8e-3, 'R': 6.225, 'dR_dT': 0.0099, 'V_rms': 0.264, 'H_e': 100e-9,
-                                   'rho_C_e': 2.5116e6},
-            '大传感器D3 (200μm)': {'b': 200e-6, 'L': 7e-3, 'R': 6.664, 'dR_dT': 0.011, 'V_rms': 0.264, 'H_e': 100e-9,
-                                   'rho_C_e': 2.5116e6},
-            '大传感器D4 (150μm)': {'b': 150e-6, 'L': 6e-3, 'R': 7.29, 'dR_dT': 0.0122, 'V_rms': 0.264, 'H_e': 100e-9,
-                                   'rho_C_e': 2.5116e6},
-            '小传感器X1 (50μm)': {'b': 50e-6, 'L': 2e-3, 'R': 9.398, 'dR_dT': 0.0149, 'V_rms': 0.4, 'H_e': 100e-9,
-                                  'rho_C_e': 2.5116e6},
-            '小传感器X2 (20μm)': {'b': 20e-6, 'L': 2e-3, 'R': 6.74, 'dR_dT': 0.014391, 'V_rms': 0.4, 'H_e': 100e-9,
-                                  'rho_C_e': 2.5116e6},
-            '小传感器X3 (5μm)': {'b': 5e-6, 'L': 2e-3, 'R': 6.74, 'dR_dT': 0.014391, 'V_rms': 0.4, 'H_e': 100e-9,
-                                 'rho_C_e': 2.5116e6},
-            'Custom (自定义)': {'b': 200e-6, 'L': 5e-3, 'R': 5.6, 'dR_dT': 1.9583e-02, 'V_rms': 0.43, 'H_e': 100e-9,
-                                'rho_C_e': 2.5116e6}
+            '大传感器D1 (300μm)': {'b': 300e-6, 'L': 9e-3, 'R': 5.985, 'alpha_R': 0.0094 / 5.985,
+                                   'V_rms': 0.264, 'H_e': 100e-9, 'rho_C_e': 2.5116e6},
+            '大传感器D2 (250μm)': {'b': 250e-6, 'L': 8e-3, 'R': 6.225, 'alpha_R': 0.0099 / 6.225,
+                                   'V_rms': 0.264, 'H_e': 100e-9, 'rho_C_e': 2.5116e6},
+            '大传感器D3 (200μm)': {'b': 200e-6, 'L': 7e-3, 'R': 6.664, 'alpha_R': 0.011 / 6.664,
+                                   'V_rms': 0.264, 'H_e': 100e-9, 'rho_C_e': 2.5116e6},
+            '大传感器D4 (150μm)': {'b': 150e-6, 'L': 6e-3, 'R': 7.29, 'alpha_R': 0.0122 / 7.29,
+                                   'V_rms': 0.264, 'H_e': 100e-9, 'rho_C_e': 2.5116e6},
+            '小传感器X1 (50μm)': {'b': 50e-6, 'L': 2e-3, 'R': 9.398, 'alpha_R': 0.0149 / 9.398,
+                                  'V_rms': 0.4, 'H_e': 100e-9, 'rho_C_e': 2.5116e6},
+            '小传感器X2 (20μm)': {'b': 20e-6, 'L': 2e-3, 'R': 6.74, 'alpha_R': 0.014391 / 6.74,
+                                  'V_rms': 0.4, 'H_e': 100e-9, 'rho_C_e': 2.5116e6},
+            '小传感器X3 (5μm)': {'b': 5e-6, 'L': 2e-3, 'R': 6.74, 'alpha_R': 0.014391 / 6.74,
+                                 'V_rms': 0.4, 'H_e': 100e-9, 'rho_C_e': 2.5116e6},
+            'Custom (自定义)': {'b': 200e-6, 'L': 5e-3, 'R': 5.6, 'alpha_R': 1.9583e-02 / 5.6,
+                                'V_rms': 0.43, 'H_e': 100e-9, 'rho_C_e': 2.5116e6},
         }
 
     def get_sensor(self, name):
@@ -195,7 +364,7 @@ class TemperatureCalculatorDialog(QDialog):
 
         sensor_layout.addWidget(QLabel("温度系数 α_R (/K):"), 1, 0)
         self.alpha_input = QLineEdit("0.0022")
-        self.alpha_input.setToolTip("相对温度系数 α_R = (dR/dT) / R；由拟合页 dR_dT 与 R 换算")
+        self.alpha_input.setToolTip("相对电阻温度系数 α_R (/K)；与拟合页一致。旧数据 dR/dT 加载时自动换算为 α_R=(dR/dT)/R")
         sensor_layout.addWidget(self.alpha_input, 1, 1)
 
         sensor_layout.addWidget(QLabel("线长 L (mm):"), 2, 0)
@@ -256,22 +425,22 @@ class TemperatureCalculatorDialog(QDialog):
         if not sensor_params:
             return
         try:
-            R = float(sensor_params.get('R', self.r_input.text()))
+            ui = sensor_dict_for_ui(sensor_params)
+            R = float(ui.get('R', self.r_input.text()))
             self.r_input.setText(f"{R:.6g}")
 
-            if 'dR_dT' in sensor_params and R != 0:
-                alpha_R = float(sensor_params['dR_dT']) / R
-                self.alpha_input.setText(f"{alpha_R:.6g}")
+            if 'alpha_R' in ui:
+                self.alpha_input.setText(f"{float(ui['alpha_R']):.6g}")
 
-            if 'L' in sensor_params:
-                self.l_input.setText(f"{float(sensor_params['L']) * 1e3:.6g}")
+            if 'L' in ui:
+                self.l_input.setText(f"{float(ui['L']) * 1e3:.6g}")
 
-            if 'b' in sensor_params:
+            if 'b' in ui:
                 # 拟合页 b 为半宽 (m) → 线宽 2b (μm)
-                self.width_input.setText(f"{2.0 * float(sensor_params['b']) * 1e6:.6g}")
+                self.width_input.setText(f"{2.0 * float(ui['b']) * 1e6:.6g}")
 
-            if 'V_rms' in sensor_params:
-                self.v_drive_input.setText(f"{float(sensor_params['V_rms']) * 1e3:.6g}")
+            if 'V_rms' in ui:
+                self.v_drive_input.setText(f"{float(ui['V_rms']) * 1e3:.6g}")
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
@@ -287,7 +456,7 @@ class TemperatureCalculatorDialog(QDialog):
             self.apply_sensor_params(sp)
             self.result_area.append(
                 f"\n已从数据拟合同步: R={sp.get('R')}, "
-                f"dR/dT={sp.get('dR_dT')}, L={sp.get('L')}, b={sp.get('b')}, "
+                f"α_R={sp.get('alpha_R')}, L={sp.get('L')}, b={sp.get('b')}, "
                 f"V_rms={sp.get('V_rms')}\n"
             )
         except Exception as e:
@@ -384,10 +553,13 @@ class SimulationWidget(QWidget):
         left_panel = QScrollArea()
         left_widget = QWidget()
         self.left_layout = QVBoxLayout(left_widget)
+        self.left_layout.setContentsMargins(8, 8, 8, 8)
+        self.left_layout.setSpacing(8)
 
         # 传感器参数
         sensor_group = QGroupBox("传感器设置")
         sensor_layout = QGridLayout()
+        sensor_layout.setColumnStretch(1, 1)
         self.sensor_combo = QComboBox()
         self.sensor_combo.addItems(self.sensor_db.get_sensor_names())
         self.sensor_combo.currentTextChanged.connect(self.load_sensor)
@@ -395,10 +567,11 @@ class SimulationWidget(QWidget):
         sensor_layout.addWidget(self.sensor_combo, 0, 1)
 
         self.sensor_inputs = {}
-        params = ['b', 'L', 'R', 'dR_dT', 'V_rms', 'H_e', 'rho_C_e']
-        for i, p in enumerate(params):
-            sensor_layout.addWidget(QLabel(p), i + 1, 0)
+        for i, p in enumerate(SENSOR_UI_PARAMS):
+            label = SENSOR_UI_LABELS[i] if i < len(SENSOR_UI_LABELS) else p
+            sensor_layout.addWidget(QLabel(label), i + 1, 0)
             inp = QLineEdit()
+            inp.setMinimumWidth(0)
             inp.textChanged.connect(self.schedule_update)  # 绑定自动更新
             self.sensor_inputs[p] = inp
             sensor_layout.addWidget(inp, i + 1, 1)
@@ -518,7 +691,9 @@ class SimulationWidget(QWidget):
 
         left_panel.setWidget(left_widget)
         left_panel.setWidgetResizable(True)
-        left_panel.setMaximumWidth(400)
+        left_panel.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_panel.setMinimumWidth(460)
+        left_panel.setMaximumWidth(520)
         layout.addWidget(left_panel)
 
         # 右侧：绘图
@@ -551,16 +726,15 @@ class SimulationWidget(QWidget):
         )
         if filename:
             try:
-                if filename.endswith('.xlsx'):
-                    df = pd.read_excel(filename)
-                else:
-                    df = pd.read_csv(filename)
+                df, model_config = load_dataframe_with_model_config(filename)
 
                 # 简单列名检测逻辑
                 if '频率 (Hz)' in df.columns:
                     freq_col = '频率 (Hz)'
                 elif 'Frequency' in df.columns:
                     freq_col = 'Frequency'
+                elif 'frequency' in df.columns:
+                    freq_col = 'frequency'
                 else:
                     freq_col = df.columns[0]  # 默认第一列
 
@@ -570,9 +744,9 @@ class SimulationWidget(QWidget):
 
                 cols = df.columns
                 for c in cols:
-                    if 'V3_幅值' in c or ('V3' in c and 'amp' in c.lower()) or 'Amplitude_3f' in c:
+                    if 'V3_幅值' in str(c) or ('V3' in str(c) and 'amp' in str(c).lower()) or 'Amplitude_3f' in str(c) or str(c) == 'v3_amp':
                         v3_amp_col = c
-                    if 'V3_相位' in c or ('V3' in c and 'phase' in c.lower()) or 'Phase_3f' in c:
+                    if 'V3_相位' in str(c) or ('V3' in str(c) and 'phase' in str(c).lower()) or 'Phase_3f' in str(c) or str(c) == 'v3_phase':
                         v3_phase_col = c
 
                 # 如果找不到幅值相位，尝试找实部虚部
@@ -580,9 +754,9 @@ class SimulationWidget(QWidget):
                 v3_imag_col = None
                 if v3_amp_col is None:
                     for c in cols:
-                        if 'V3_Real' in c or 'v3_real' in c.lower():
+                        if 'V3_Real' in str(c) or 'v3_real' in str(c).lower():
                             v3_real_col = c
-                        if 'V3_Imag' in c or 'v3_imag' in c.lower():
+                        if 'V3_Imag' in str(c) or 'v3_imag' in str(c).lower():
                             v3_imag_col = c
 
                 if v3_amp_col is None and (v3_real_col is None or v3_imag_col is None):
@@ -596,7 +770,18 @@ class SimulationWidget(QWidget):
                 }
 
                 self.exp_file_label.setText(os.path.basename(filename))
-                QMessageBox.information(self, "成功", "实验数据加载成功")
+
+                meta_msg = ""
+                if model_config:
+                    self.apply_model_config(model_config)
+                    # 同步到数据拟合页（若已关联）
+                    if self._fitting_source is not None and hasattr(self._fitting_source, 'apply_model_config'):
+                        self._fitting_source.apply_model_config(model_config)
+                    n_s = len(model_config.get('sensor') or {})
+                    n_l = len(model_config.get('layers') or [])
+                    meta_msg = f"\n已自动载入传感器参数 {n_s} 项、材料层 {n_l} 层。"
+
+                QMessageBox.information(self, "成功", f"实验数据加载成功{meta_msg}")
 
                 # 刷新图表
                 self.run_simulation_silent()
@@ -645,12 +830,21 @@ class SimulationWidget(QWidget):
             df['V3_幅值'] = np.abs(V3)
             df['V3_相位'] = np.degrees(np.unwrap(np.angle(V3)))  # 保存为展开后的度数，避免跳变
 
-            if filename.endswith('.xlsx'):
-                df.to_excel(filename, index=False)
+            model_config = None
+            if self._fitting_source is not None and hasattr(self._fitting_source, 'get_model_config'):
+                try:
+                    model_config = self._fitting_source.get_model_config()
+                except Exception:
+                    model_config = None
+
+            if filename.lower().endswith(('.xlsx', '.xlsm')):
+                wrote_meta = save_dataframe_with_model_config(filename, df, model_config)
             else:
                 df.to_csv(filename, index=False)
+                wrote_meta = False
 
-            QMessageBox.information(self, "成功", f"数据已保存至:\n{filename}")
+            extra = "\n已同时写入传感器/材料参数工作表。" if wrote_meta else ""
+            QMessageBox.information(self, "成功", f"数据已保存至:\n{filename}{extra}")
 
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"保存文件时出错:\n{str(e)}")
@@ -741,6 +935,7 @@ class SimulationWidget(QWidget):
         container_layout.addLayout(header)
 
         layout = QGridLayout()
+        layout.setColumnStretch(1, 1)
         mat_combo = QComboBox()
         mat_combo.addItems(self.material_db.get_material_names())
         layout.addWidget(QLabel("材料:"), 0, 0)
@@ -751,6 +946,7 @@ class SimulationWidget(QWidget):
         for i, p in enumerate(props):
             layout.addWidget(QLabel(p), i + 1, 0)
             inp = QLineEdit()
+            inp.setMinimumWidth(0)
             inp.textChanged.connect(self.schedule_update)
             inputs[p] = inp
             layout.addWidget(inp, i + 1, 1)
@@ -788,7 +984,7 @@ class SimulationWidget(QWidget):
         """应用传感器参数与材料层结构配置。"""
         self.update_timer.stop()
         try:
-            sensor = config.get('sensor', {})
+            sensor = sensor_dict_for_ui(config.get('sensor', {}) or {})
             for param, value in sensor.items():
                 if param in self.sensor_inputs:
                     self.sensor_inputs[param].setText(str(value))
@@ -854,8 +1050,10 @@ class SimulationWidget(QWidget):
                                 np.log10(float(self.freq_max.text())),
                                 int(self.freq_pts.text()))
 
-            # 2. 传感器
-            sensor = {k: float(v.text()) for k, v in self.sensor_inputs.items()}
+            # 2. 传感器（界面 α_R → 模型 dR_dT）
+            sensor = sensor_dict_for_model(
+                {k: v.text() for k, v in self.sensor_inputs.items()}
+            )
 
             # 3. 层
             layers = []
@@ -1101,7 +1299,8 @@ class SensitivityWidget(SimulationWidget):
             freqs = np.logspace(np.log10(float(self.freq_min.text())),
                                 np.log10(float(self.freq_max.text())),
                                 int(self.freq_pts.text()))
-            sensor = {k: float(v.text()) for k, v in self.sensor_inputs.items()}
+            sensor_ui = {k: float(v.text()) for k, v in self.sensor_inputs.items()}
+            sensor = sensor_dict_for_model(sensor_ui)
             layers = []
             for w in self.layer_widgets:
                 l_data = {}
@@ -1130,14 +1329,14 @@ class SensitivityWidget(SimulationWidget):
             import copy
 
             for name, info in selected_params:
-                # 准备扰动数据
-                mod_sensor = sensor.copy()
+                # 准备扰动数据（在 UI 参数空间扰动，再换算为模型参数）
+                mod_sensor_ui = sensor_ui.copy()
                 mod_layers = copy.deepcopy(layers)
 
                 type_ = info[0]
                 if type_ == 'sensor':
                     param = info[1]
-                    mod_sensor[param] *= (1 + perturbation)
+                    mod_sensor_ui[param] *= (1 + perturbation)
                 else:  # layer
                     layer_idx, param = info[1], info[2]
                     orig_val = mod_layers[layer_idx][param]
@@ -1153,6 +1352,7 @@ class SensitivityWidget(SimulationWidget):
                         mod_layers[layer_idx][param] *= (1 + perturbation)
 
                 # 计算新值 (同样需要反转layers)
+                mod_sensor = sensor_dict_for_model(mod_sensor_ui)
                 model_layers_mod = mod_layers[::-1]
                 Z_new = calculate_analytical_Z(freqs, mod_sensor['b'], model_layers_mod)
                 V3_new = convert_Z_to_V3(Z_new, freqs, mod_sensor['b'], mod_sensor)
@@ -1719,22 +1919,187 @@ class DataAcquisitionThread(QThread):
         self.is_running = False
 
 
+class LiveMonitorThread(QThread):
+    """锁相实时监视：周期读 1ω/3ω，并支持切换差分。"""
+    reading = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+    finished_monitor = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._stop = False
+        self._diff_on = True
+        self._diff_dirty = True
+        self.lockin = None
+        self.cfg = {}
+
+    def setup(
+        self,
+        lockin_backend='zurich',
+        device_id='dev3791',
+        zi_host='192.168.59.62',
+        zi_port=8004,
+        oe_tcp_host='192.168.1.1',
+        oe_tcp_port=10001,
+        oe_serial_port='COM3',
+        oe_input_range_index=None,
+        freq_hz=635.0,
+        output_v=0.4,
+        diff_on=True,
+        interval_s=0.5,
+        oe_snap_n_samples=4,
+        oe_snap_duration=0.4,
+    ):
+        self.cfg = dict(
+            lockin_backend=(lockin_backend or 'zurich').lower(),
+            device_id=device_id,
+            zi_host=zi_host,
+            zi_port=int(zi_port),
+            oe_tcp_host=oe_tcp_host,
+            oe_tcp_port=int(oe_tcp_port),
+            oe_serial_port=oe_serial_port,
+            oe_input_range_index=oe_input_range_index,
+            freq_hz=float(freq_hz),
+            output_v=float(output_v),
+            interval_s=max(0.2, float(interval_s)),
+            oe_snap_n_samples=max(1, int(oe_snap_n_samples)),
+            oe_snap_duration=max(0.05, float(oe_snap_duration)),
+        )
+        self._diff_on = bool(diff_on)
+        self._diff_dirty = True
+        self._stop = False
+
+    def set_diff(self, on: bool):
+        self._diff_on = bool(on)
+        self._diff_dirty = True
+
+    def stop(self):
+        self._stop = True
+
+    def _connect(self):
+        c = self.cfg
+        backend = c['lockin_backend']
+        if backend == 'zurich':
+            return ZurichLockInControl(
+                c['device_id'], server_host=c['zi_host'], server_port=c['zi_port']
+            )
+        if backend == 'oe1300_tcp':
+            li = OE1300LockInControl(
+                connection='tcp',
+                tcp_host=c['oe_tcp_host'],
+                tcp_port=c['oe_tcp_port'],
+            )
+        elif backend == 'oe1300_serial':
+            li = OE1300LockInControl(
+                connection='serial',
+                serial_port=c['oe_serial_port'],
+            )
+        else:
+            raise ValueError(f"未知锁相类型: {backend}")
+        if c['oe_input_range_index'] is not None:
+            li.set_input_range_index(int(c['oe_input_range_index']))
+        return li
+
+    @staticmethod
+    def _set_output(lockin, amplitude: float):
+        lockin.configure_signal_outputs(0, float(amplitude), True, 10.0, 0.0)
+
+    def run(self):
+        self.lockin = None
+        try:
+            c = self.cfg
+            backend = c['lockin_backend']
+            self.lockin = self._connect()
+            freq = max(1e-6, c['freq_hz'])
+            tc = LOCKIN_TC_FACTOR / freq
+            self._set_output(self.lockin, c['output_v'])
+            self.lockin.configure_lockin(freq=freq, order_time=4, time_constant=tc)
+            while not self._stop:
+                if self._diff_dirty:
+                    self.lockin.configure_signal_inputs(
+                        input_channel=0, range=1.0, ac=False, diff=self._diff_on
+                    )
+                    self._diff_dirty = False
+                    time.sleep(0.05)
+                    self.lockin.wait_for_integration(tc, duration_multiplier=3)
+
+                if backend == 'zurich':
+                    x1, y1, x3, y3 = self.lockin.read_demod_data(duration=0.35)
+                else:
+                    x1, y1, x3, y3 = self.lockin.read_demod_data(
+                        duration=c['oe_snap_duration'],
+                        n_samples=c['oe_snap_n_samples'],
+                    )
+                a1, p1, x1m, y1m = self.lockin.calculate_amplitude_phase(x1, y1)
+                a3, p3, x3m, y3m = self.lockin.calculate_amplitude_phase(x3, y3)
+                self.reading.emit({
+                    'diff_on': self._diff_on,
+                    'freq_hz': freq,
+                    'output_v': c['output_v'],
+                    'v1_amp': a1,
+                    'v1_phase': p1,
+                    'v1_x': x1m,
+                    'v1_y': y1m,
+                    'v3_amp': a3,
+                    'v3_phase': p3,
+                    'v3_x': x3m,
+                    'v3_y': y3m,
+                })
+                # 分段 sleep，便于快速停止
+                t_end = time.time() + c['interval_s']
+                while not self._stop and time.time() < t_end:
+                    time.sleep(0.05)
+        except Exception as e:
+            if not self._stop:
+                self.error_occurred.emit(str(e))
+        finally:
+            if self.lockin is not None:
+                try:
+                    self.lockin.disconnect()
+                except Exception:
+                    pass
+                self.lockin = None
+            self.finished_monitor.emit()
+
+
 class LockInControlWidget(QWidget):
     """锁相放大器控制界面"""
 
     def __init__(self):
         super().__init__()
         self.acquisition_thread = DataAcquisitionThread()
+        self.auto_balance_thread = AutoBalanceThread()
+        self.live_monitor_thread = LiveMonitorThread()
         self.collected_data = []
+        self.balance_resistor = BalanceResistorController()
+        self._balance_umax_v = None  # 设备回读：1ω 信号上限（非锁相输出上限）
+        self._monitor_diff_on = True
+        self._fitting_source = None
         self.init_ui()
         self.connect_signals()
 
+    def set_fitting_source(self, fitting_widget):
+        """关联数据拟合页，保存测量时写入传感器/材料参数。"""
+        self._fitting_source = fitting_widget
+
     def init_ui(self):
         layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        def _compact_grid(g: QGridLayout):
+            g.setContentsMargins(6, 4, 6, 4)
+            g.setHorizontalSpacing(4)
+            g.setVerticalSpacing(3)
+
+        # —— 顶部三栏并列：设备连接 | 数控调平电阻 | 自动调平 ——
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
 
         # 设备连接组
         device_group = QGroupBox("设备连接")
         device_layout = QGridLayout()
+        _compact_grid(device_layout)
 
         device_layout.addWidget(QLabel("锁相类型:"), 0, 0)
         self.lockin_type_combo = QComboBox()
@@ -1746,22 +2111,21 @@ class LockInControlWidget(QWidget):
         self.lockin_type_combo.setToolTip(
             "OE1300 使用手册 ASCII 指令；网口默认 192.168.1.1:10001"
         )
-        device_layout.addWidget(self.lockin_type_combo, 0, 1)
+        device_layout.addWidget(self.lockin_type_combo, 0, 1, 1, 3)
 
-        device_layout.addWidget(QLabel("苏黎世 IP/Device:"), 1, 0)
-
-        zi_box = QHBoxLayout()
+        device_layout.addWidget(QLabel("苏黎世:"), 1, 0)
         self.zi_host_input = QLineEdit("192.168.59.62")
         self.zi_port_spin = QSpinBox()
         self.zi_port_spin.setRange(1, 65535)
         self.zi_port_spin.setValue(8004)
+        self.zi_port_spin.setMaximumWidth(70)
         self.device_id_input = QLineEdit("dev3791")
-
-        zi_box.addWidget(self.zi_host_input)
+        zi_box = QHBoxLayout()
+        zi_box.setSpacing(2)
+        zi_box.addWidget(self.zi_host_input, 2)
         zi_box.addWidget(QLabel(":"))
         zi_box.addWidget(self.zi_port_spin)
-        zi_box.addWidget(self.device_id_input)
-
+        zi_box.addWidget(self.device_id_input, 1)
         device_layout.addLayout(zi_box, 1, 1, 1, 3)
 
         device_layout.addWidget(QLabel("OE1300 IP:"), 2, 0)
@@ -1771,35 +2135,245 @@ class LockInControlWidget(QWidget):
         self.oe_port_spin = QSpinBox()
         self.oe_port_spin.setRange(1, 65535)
         self.oe_port_spin.setValue(10001)
+        self.oe_port_spin.setMaximumWidth(70)
         device_layout.addWidget(self.oe_port_spin, 2, 3)
 
-        device_layout.addWidget(QLabel("OE1300 串口:"), 3, 0)
+        device_layout.addWidget(QLabel("OE串口:"), 3, 0)
         self.oe_serial_input = QLineEdit("COM3")
         device_layout.addWidget(self.oe_serial_input, 3, 1)
-        device_layout.addWidget(QLabel("IRNG索引(可选):"), 3, 2)
+        device_layout.addWidget(QLabel("IRNG:"), 3, 2)
         self.oe_irng_spin = QSpinBox()
         self.oe_irng_spin.setRange(-1, 255)
         self.oe_irng_spin.setValue(-1)
         self.oe_irng_spin.setSpecialValueText("不下发")
         self.oe_irng_spin.setToolTip("-1 表示不通过指令设置 IRNG，请在仪器面板选量程")
+        self.oe_irng_spin.setMaximumWidth(70)
         device_layout.addWidget(self.oe_irng_spin, 3, 3)
 
         self.connect_btn = QPushButton("连接/检测")
         self.connect_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
-        device_layout.addWidget(self.connect_btn, 1, 2, 1, 2)
-
+        device_layout.addWidget(self.connect_btn, 4, 0, 1, 2)
         self.status_label = QLabel("状态: 未连接")
         self.status_label.setStyleSheet("QLabel { color: red; }")
-        device_layout.addWidget(self.status_label, 4, 0, 1, 4)
+        device_layout.addWidget(self.status_label, 4, 2, 1, 2)
 
         self.lockin_type_combo.currentIndexChanged.connect(self._on_lockin_type_changed)
-
         device_group.setLayout(device_layout)
-        layout.addWidget(device_group)
 
-        # 测量参数组
+        # 数控调平电阻
+        balance_group = QGroupBox("数控调平电阻")
+        balance_group.setToolTip(
+            "指令 AT+RES.SP=x.xxx/ ；回读 +UMax(V) 为 1ω 信号上限（不是锁相输出上限）。"
+            + ("" if BALANCE_SERIAL_AVAILABLE else " 【未检测到 pyserial】")
+        )
+        balance_layout = QGridLayout()
+        _compact_grid(balance_layout)
+
+        balance_layout.addWidget(QLabel("串口:"), 0, 0)
+        self.balance_port_combo = QComboBox()
+        self.balance_port_combo.setEditable(True)
+        balance_layout.addWidget(self.balance_port_combo, 0, 1)
+        self.balance_refresh_ports_btn = QPushButton("刷新")
+        self.balance_refresh_ports_btn.setMaximumWidth(48)
+        balance_layout.addWidget(self.balance_refresh_ports_btn, 0, 2)
+
+        balance_layout.addWidget(QLabel("波特率:"), 1, 0)
+        self.balance_baud_combo = QComboBox()
+        self.balance_baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
+        self.balance_baud_combo.setCurrentText("9600")
+        balance_layout.addWidget(self.balance_baud_combo, 1, 1, 1, 2)
+
+        self.balance_connect_btn = QPushButton("连接")
+        self.balance_connect_btn.setStyleSheet(
+            "QPushButton { background-color: #607D8B; color: white; }")
+        balance_layout.addWidget(self.balance_connect_btn, 2, 0)
+        self.balance_status_label = QLabel("未连接")
+        self.balance_status_label.setStyleSheet("QLabel { color: #888; }")
+        balance_layout.addWidget(self.balance_status_label, 2, 1, 1, 2)
+
+        balance_layout.addWidget(QLabel("电阻(Ω):"), 3, 0)
+        self.balance_res_spin = QDoubleSpinBox()
+        self.balance_res_spin.setRange(0.0, 1e6)
+        self.balance_res_spin.setDecimals(3)
+        self.balance_res_spin.setSingleStep(0.001)
+        self.balance_res_spin.setValue(1.234)
+        self.balance_res_spin.setToolTip("下发指令: AT+RES.SP=<值>/")
+        balance_layout.addWidget(self.balance_res_spin, 3, 1)
+        self.balance_set_btn = QPushButton("下发")
+        self.balance_set_btn.setEnabled(False)
+        self.balance_set_btn.setStyleSheet(
+            "QPushButton { background-color: #3F51B5; color: white; }")
+        balance_layout.addWidget(self.balance_set_btn, 3, 2)
+
+        balance_layout.addWidget(QLabel("SP/PV:"), 4, 0)
+        self.balance_sp_label = QLabel("—")
+        self.balance_pv_label = QLabel("—")
+        sp_pv = QHBoxLayout()
+        sp_pv.setSpacing(4)
+        sp_pv.addWidget(self.balance_sp_label)
+        sp_pv.addWidget(QLabel("/"))
+        sp_pv.addWidget(self.balance_pv_label)
+        sp_pv.addStretch(1)
+        balance_layout.addLayout(sp_pv, 4, 1, 1, 2)
+
+        balance_layout.addWidget(QLabel("UMax(V):"), 5, 0)
+        self.balance_umax_label = QLabel("—")
+        self.balance_umax_label.setStyleSheet(
+            "QLabel { font-weight: bold; color: #E65100; }")
+        self.balance_umax_label.setToolTip(
+            "来自设备回读 +UMax(V)=…；锁到的 1ω 信号幅值请勿超过此值（不是信号发生器/锁相输出上限）"
+        )
+        balance_layout.addWidget(self.balance_umax_label, 5, 1)
+        self.balance_tamb_label = QLabel("—")
+        self.balance_tamb_label.setToolTip("环境温度 TAmb (°C)")
+        balance_layout.addWidget(self.balance_tamb_label, 5, 2)
+
+        self.balance_voltage_warn_label = QLabel("")
+        self.balance_voltage_warn_label.setWordWrap(True)
+        self.balance_voltage_warn_label.setStyleSheet(
+            "QLabel { color: #C62828; font-weight: bold; font-size: 11px; }"
+        )
+        balance_layout.addWidget(self.balance_voltage_warn_label, 6, 0, 1, 3)
+
+        balance_group.setLayout(balance_layout)
+
+        # 自动调平
+        autobal_group = QGroupBox("自动调平")
+        autobal_group.setToolTip(
+            "①适中频率/幅值+开差分 → ②调电阻使差分1ω→0 → ③关差分 → "
+            "④调输出使单端1ω=目标 → ⑤再开差分检查；偏大则精调。"
+        )
+        autobal_layout = QGridLayout()
+        _compact_grid(autobal_layout)
+
+        autobal_layout.addWidget(QLabel("频率(Hz):"), 0, 0)
+        self.autobal_freq_spin = QDoubleSpinBox()
+        self.autobal_freq_spin.setRange(1.0, 1e6)
+        self.autobal_freq_spin.setDecimals(1)
+        self.autobal_freq_spin.setValue(635.0)
+        autobal_layout.addWidget(self.autobal_freq_spin, 0, 1)
+
+        autobal_layout.addWidget(QLabel("粗调输出(V):"), 0, 2)
+        self.autobal_coarse_v_spin = QDoubleSpinBox()
+        self.autobal_coarse_v_spin.setRange(0.001, 10.0)
+        self.autobal_coarse_v_spin.setDecimals(3)
+        self.autobal_coarse_v_spin.setSingleStep(0.1)
+        self.autobal_coarse_v_spin.setValue(2.0)
+        self.autobal_coarse_v_spin.setToolTip(
+            "第一步差分调平时的锁相输出幅值；苏黎世上限 10 V，OE1300 上限 5 V"
+        )
+        autobal_layout.addWidget(self.autobal_coarse_v_spin, 0, 3)
+
+        autobal_layout.addWidget(QLabel("目标1ω(V):"), 1, 0)
+        self.autobal_target_v1_spin = QDoubleSpinBox()
+        self.autobal_target_v1_spin.setRange(0.001, 5.0)
+        self.autobal_target_v1_spin.setDecimals(3)
+        self.autobal_target_v1_spin.setSingleStep(0.01)
+        self.autobal_target_v1_spin.setValue(0.200)
+        self.autobal_target_v1_spin.setToolTip(
+            "关差分后，调节锁相输出，使单端锁到的 1ω 达到该幅值；"
+            "该值（及实测 1ω）不得超过数控电阻回读的 UMax"
+        )
+        autobal_layout.addWidget(self.autobal_target_v1_spin, 1, 1)
+
+        autobal_layout.addWidget(QLabel("合格(μV):"), 1, 2)
+        self.autobal_diff_ok_spin = QDoubleSpinBox()
+        self.autobal_diff_ok_spin.setRange(1.0, 1e6)
+        self.autobal_diff_ok_spin.setDecimals(0)
+        self.autobal_diff_ok_spin.setValue(300.0)
+        self.autobal_diff_ok_spin.setToolTip("差分模式下 1ω 幅值低于此值视为调平合格")
+        autobal_layout.addWidget(self.autobal_diff_ok_spin, 1, 3)
+
+        autobal_layout.addWidget(QLabel("最大ΔR(Ω):"), 2, 0)
+        self.autobal_step_spin = QDoubleSpinBox()
+        self.autobal_step_spin.setRange(0.001, 10.0)
+        self.autobal_step_spin.setDecimals(3)
+        self.autobal_step_spin.setValue(0.050)
+        self.autobal_step_spin.setToolTip(
+            "PI 调平单步电阻变化上限；实际步长由误差 X 与灵敏度 dX/dR 自动计算"
+        )
+        autobal_layout.addWidget(self.autobal_step_spin, 2, 1)
+
+        autobal_layout.addWidget(QLabel("R范围:"), 2, 2)
+        self.autobal_r_min_spin = QDoubleSpinBox()
+        self.autobal_r_min_spin.setRange(0.0, 1e6)
+        self.autobal_r_min_spin.setDecimals(3)
+        self.autobal_r_min_spin.setValue(0.100)
+        self.autobal_r_max_spin = QDoubleSpinBox()
+        self.autobal_r_max_spin.setRange(0.001, 1e6)
+        self.autobal_r_max_spin.setDecimals(3)
+        self.autobal_r_max_spin.setValue(100.0)
+        r_range_row = QHBoxLayout()
+        r_range_row.setSpacing(2)
+        r_range_row.addWidget(self.autobal_r_min_spin)
+        r_range_row.addWidget(QLabel("~"))
+        r_range_row.addWidget(self.autobal_r_max_spin)
+        autobal_layout.addLayout(r_range_row, 2, 3)
+
+        self.autobal_start_btn = QPushButton("开始调平")
+        self.autobal_start_btn.setStyleSheet(
+            "QPushButton { background-color: #00897B; color: white; font-weight: bold; }"
+        )
+        autobal_layout.addWidget(self.autobal_start_btn, 3, 0, 1, 2)
+        self.autobal_stop_btn = QPushButton("停止")
+        self.autobal_stop_btn.setEnabled(False)
+        self.autobal_stop_btn.setStyleSheet(
+            "QPushButton { background-color: #E53935; color: white; }"
+        )
+        autobal_layout.addWidget(self.autobal_stop_btn, 3, 2, 1, 2)
+
+        # 紧凑实时状态（单行标签，无嵌套 GroupBox）
+        self.autobal_phase_label = QLabel("阶段: —")
+        self.autobal_phase_label.setStyleSheet("QLabel { color: #555; font-size: 11px; }")
+        self.autobal_phase_label.setWordWrap(True)
+        autobal_layout.addWidget(self.autobal_phase_label, 4, 0, 1, 4)
+
+        self.autobal_r_live_label = QLabel("—")
+        self.autobal_r_live_label.setStyleSheet("QLabel { font-weight: bold; }")
+        self.autobal_diff_live_label = QLabel("—")
+        self.autobal_diff_live_label.setStyleSheet("QLabel { font-weight: bold; }")
+        self.autobal_v1_live_label = QLabel("—")
+        self.autobal_v1_live_label.setStyleSheet(
+            "QLabel { font-weight: bold; color: #1565C0; }"
+        )
+        self.autobal_vout_live_label = QLabel("—")
+        live_row = QHBoxLayout()
+        live_row.setSpacing(6)
+        live_row.addWidget(QLabel("R:"))
+        live_row.addWidget(self.autobal_r_live_label)
+        live_row.addWidget(QLabel("差分:"))
+        live_row.addWidget(self.autobal_diff_live_label)
+        live_row.addWidget(QLabel("1ω:"))
+        live_row.addWidget(self.autobal_v1_live_label)
+        live_row.addWidget(QLabel("输出:"))
+        live_row.addWidget(self.autobal_vout_live_label)
+        live_row.addStretch(1)
+        autobal_layout.addLayout(live_row, 5, 0, 1, 4)
+
+        self.autobal_msg_label = QLabel(
+            "先连接调平电阻。差分调平采用有符号 X 的 PI：自动估 dX/dR 并决定步长。"
+        )
+        self.autobal_msg_label.setWordWrap(True)
+        self.autobal_msg_label.setStyleSheet("QLabel { color: #555; font-size: 11px; }")
+        autobal_layout.addWidget(self.autobal_msg_label, 6, 0, 1, 4)
+
+        autobal_group.setLayout(autobal_layout)
+
+        top_row.addWidget(device_group, 1)
+        top_row.addWidget(balance_group, 1)
+        top_row.addWidget(autobal_group, 1)
+        layout.addLayout(top_row)
+        self._refresh_balance_ports()
+
+        # 测量参数组（左：参数；右：实时 1ω/3ω + 差分）
         param_group = QGroupBox("测量参数")
-        param_layout = QGridLayout()
+        param_outer = QHBoxLayout()
+        param_outer.setContentsMargins(4, 4, 4, 4)
+        param_outer.setSpacing(8)
+
+        param_left = QWidget()
+        param_layout = QGridLayout(param_left)
+        _compact_grid(param_layout)
 
         # 频率设置
         param_layout.addWidget(QLabel("起始频率 (Hz):"), 0, 0)
@@ -1841,14 +2415,13 @@ class LockInControlWidget(QWidget):
         self.measurement_count.setValue(1)
         param_layout.addWidget(self.measurement_count, 2, 3)
 
-        # 滤波器稳定等待：默认自动 = 时间常数×倍数（τ=5/f Hz，与当前苏黎世/OE1300 共用逻辑）
+        # 滤波器稳定等待
         param_layout.addWidget(QLabel("稳定等待:"), 3, 0)
         self.wait_manual_check = QCheckBox("手动指定等待时间 (秒)")
         self.wait_manual_check.setChecked(False)
         self.wait_manual_check.setToolTip(
             f"不勾选：每个频点等待时间 = 时间常数 × 5；"
-            f"时间常数 τ = {LOCKIN_TC_FACTOR:g}/频率(Hz)（苏黎世 timeconstant / OE1300 OFLT）。"
-            "勾选：每个频点使用下方固定秒数。"
+            f"时间常数 τ = {LOCKIN_TC_FACTOR:g}/频率(Hz)。勾选：使用固定秒数。"
         )
         param_layout.addWidget(self.wait_manual_check, 3, 1)
         param_layout.addWidget(QLabel("固定等待 (s):"), 3, 2)
@@ -1861,10 +2434,8 @@ class LockInControlWidget(QWidget):
         param_layout.addWidget(self.wait_manual_spin, 3, 3)
 
         self.wait_auto_hint = QLabel(
-            f"自动：等待 = τ×5，τ = {LOCKIN_TC_FACTOR:g}/f(Hz)；"
-            "苏黎世与 OE1300 每个频点均按此设置滤波积分（OE1300 为 OFLT）"
+            f"自动等待 = τ×5，τ = {LOCKIN_TC_FACTOR:g}/f(Hz)"
         )
-        self.wait_auto_hint.setWordWrap(True)
         self.wait_auto_hint.setStyleSheet("QLabel { color: #555; font-size: 11px; }")
         param_layout.addWidget(self.wait_auto_hint, 4, 0, 1, 4)
 
@@ -1878,45 +2449,103 @@ class LockInControlWidget(QWidget):
         self.signal_scale_spin.setSingleStep(0.000001)
         self.signal_scale_spin.setValue(1.0)
         self.signal_scale_spin.setToolTip(
-            "对 V3 实部/虚部/幅值、V1 幅值乘以该系数（<1 为缩小）；"
-            "频率与相位(°)不变。测量结束后改倍数会刷新表格与曲线；"
-            "保存文件为当前倍数下的数值。倍数可精确到小数点后 6 位。"
+            "对 V3/V1 幅值等乘以该系数；相位与频率不缩放。"
         )
         param_layout.addWidget(self.signal_scale_spin, 5, 1)
-        self.signal_scale_hint = QLabel(
-            "作用于采集电压量；相位不缩放。实时显示与「保存数据」均为缩放后数值。"
-        )
-        self.signal_scale_hint.setWordWrap(True)
-        self.signal_scale_hint.setStyleSheet("QLabel { color: #555; font-size: 11px; }")
-        param_layout.addWidget(self.signal_scale_hint, 5, 2, 1, 2)
 
-        param_layout.addWidget(QLabel("OE1300 SNAP 次数:"), 6, 0)
+        param_layout.addWidget(QLabel("OE SNAP次数:"), 5, 2)
         self.oe_snap_samples_spin = QSpinBox()
         self.oe_snap_samples_spin.setRange(1, 500)
         self.oe_snap_samples_spin.setValue(OE1300_SNAP_SAMPLES_DEFAULT)
-        self.oe_snap_samples_spin.setToolTip(
-            "仅 OE1300 测量时生效；每个频点重复 SNAP? 的次数，用于平均降噪"
-        )
-        param_layout.addWidget(self.oe_snap_samples_spin, 6, 1)
-        param_layout.addWidget(QLabel("OE1300 读数时长 (s):"), 6, 2)
+        self.oe_snap_samples_spin.setToolTip("仅 OE1300；每个频点 SNAP 次数")
+        param_layout.addWidget(self.oe_snap_samples_spin, 5, 3)
+
+        param_layout.addWidget(QLabel("OE读数时长(s):"), 6, 0)
         self.oe_snap_duration_spin = QDoubleSpinBox()
         self.oe_snap_duration_spin.setRange(0.05, 600.0)
         self.oe_snap_duration_spin.setDecimals(2)
         self.oe_snap_duration_spin.setSingleStep(0.1)
         self.oe_snap_duration_spin.setValue(OE1300_SNAP_DURATION_DEFAULT)
-        self.oe_snap_duration_spin.setToolTip(
-            "仅 OE1300；相邻 SNAP 间隔约为 max(读数时长/次数, 0.05)s"
-        )
-        param_layout.addWidget(self.oe_snap_duration_spin, 6, 3)
-
-        self.oe_snap_hint = QLabel(
-            "上两项仅在选择 OE1300（网口/串口）时参与测量；苏黎世仍用内部 poll 取数。"
-        )
-        self.oe_snap_hint.setWordWrap(True)
+        param_layout.addWidget(self.oe_snap_duration_spin, 6, 1)
+        self.oe_snap_hint = QLabel("OE SNAP 项仅 OE1300 生效")
         self.oe_snap_hint.setStyleSheet("QLabel { color: #555; font-size: 11px; }")
-        param_layout.addWidget(self.oe_snap_hint, 7, 0, 1, 4)
+        param_layout.addWidget(self.oe_snap_hint, 6, 2, 1, 2)
 
-        param_group.setLayout(param_layout)
+        # 右侧：实时监视
+        monitor_box = QGroupBox("实时监视 (1ω / 3ω)")
+        monitor_box.setStyleSheet(
+            "QGroupBox { font-weight: bold; border: 1px solid #90A4AE; "
+            "margin-top: 6px; padding-top: 4px; }"
+        )
+        mon = QGridLayout()
+        _compact_grid(mon)
+
+        mon.addWidget(QLabel("监视频率(Hz):"), 0, 0)
+        self.monitor_freq_spin = QDoubleSpinBox()
+        self.monitor_freq_spin.setRange(1.0, 1e6)
+        self.monitor_freq_spin.setDecimals(1)
+        self.monitor_freq_spin.setValue(635.0)
+        mon.addWidget(self.monitor_freq_spin, 0, 1)
+
+        mon.addWidget(QLabel("刷新(s):"), 0, 2)
+        self.monitor_interval_spin = QDoubleSpinBox()
+        self.monitor_interval_spin.setRange(0.2, 10.0)
+        self.monitor_interval_spin.setDecimals(1)
+        self.monitor_interval_spin.setValue(0.5)
+        mon.addWidget(self.monitor_interval_spin, 0, 3)
+
+        mon.addWidget(QLabel("差分通道:"), 1, 0)
+        self.monitor_diff_check = QCheckBox("开启差分 (A-B)")
+        self.monitor_diff_check.setChecked(True)
+        self.monitor_diff_check.setToolTip("勾选=差分输入；取消=单端。监视运行中可随时切换。")
+        mon.addWidget(self.monitor_diff_check, 1, 1, 1, 2)
+        self.monitor_diff_state_label = QLabel("差分: 开")
+        self.monitor_diff_state_label.setStyleSheet(
+            "QLabel { font-weight: bold; font-size: 15px; color: #2E7D32; }"
+        )
+        mon.addWidget(self.monitor_diff_state_label, 1, 3)
+
+        self.monitor_v1_label = QLabel("1ω: —")
+        self.monitor_v1_label.setStyleSheet(
+            "QLabel { font-family: Consolas, 'Courier New', monospace; "
+            "font-size: 16px; font-weight: bold; color: #1565C0; "
+            "background: #E3F2FD; padding: 8px; }"
+        )
+        self.monitor_v1_label.setWordWrap(True)
+        mon.addWidget(self.monitor_v1_label, 2, 0, 1, 4)
+
+        self.monitor_v3_label = QLabel("3ω: —")
+        self.monitor_v3_label.setStyleSheet(
+            "QLabel { font-family: Consolas, 'Courier New', monospace; "
+            "font-size: 16px; font-weight: bold; color: #6A1B9A; "
+            "background: #F3E5F5; padding: 8px; }"
+        )
+        self.monitor_v3_label.setWordWrap(True)
+        mon.addWidget(self.monitor_v3_label, 3, 0, 1, 4)
+
+        self.monitor_start_btn = QPushButton("开始监视")
+        self.monitor_start_btn.setStyleSheet(
+            "QPushButton { background-color: #0277BD; color: white; }"
+        )
+        mon.addWidget(self.monitor_start_btn, 4, 0, 1, 2)
+        self.monitor_stop_btn = QPushButton("停止监视")
+        self.monitor_stop_btn.setEnabled(False)
+        self.monitor_stop_btn.setStyleSheet(
+            "QPushButton { background-color: #C62828; color: white; }"
+        )
+        mon.addWidget(self.monitor_stop_btn, 4, 2, 1, 2)
+
+        self.monitor_status_label = QLabel("未监视（用当前锁相类型/输出电压连接读数）")
+        self.monitor_status_label.setWordWrap(True)
+        self.monitor_status_label.setStyleSheet("QLabel { color: #666; font-size: 11px; }")
+        mon.addWidget(self.monitor_status_label, 5, 0, 1, 4)
+
+        monitor_box.setLayout(mon)
+        monitor_box.setMinimumWidth(320)
+
+        param_outer.addWidget(param_left, 3)
+        param_outer.addWidget(monitor_box, 2)
+        param_group.setLayout(param_outer)
         layout.addWidget(param_group)
 
         # 控制按钮
@@ -1949,7 +2578,7 @@ class LockInControlWidget(QWidget):
 
         # 创建实时图表
         self.plot_widget = pg.GraphicsLayoutWidget()
-        self.plot_widget.setMinimumHeight(400)
+        self.plot_widget.setMinimumHeight(280)
 
         # V3幅值图
         self.amp_plot = self.plot_widget.addPlot(title="V3 幅值", row=0, col=0)
@@ -1987,6 +2616,25 @@ class LockInControlWidget(QWidget):
         self.start_btn.clicked.connect(self.start_measurement)
         self.stop_btn.clicked.connect(self.stop_measurement)
         self.save_btn.clicked.connect(self.save_data)
+
+        self.balance_refresh_ports_btn.clicked.connect(self._refresh_balance_ports)
+        self.balance_connect_btn.clicked.connect(self._toggle_balance_connection)
+        self.balance_set_btn.clicked.connect(self._set_balance_resistance)
+        self.output_voltage.valueChanged.connect(self._update_balance_voltage_warning)
+        self.autobal_target_v1_spin.valueChanged.connect(self._update_balance_voltage_warning)
+
+        self.autobal_start_btn.clicked.connect(self.start_auto_balance)
+        self.autobal_stop_btn.clicked.connect(self.stop_auto_balance)
+        self.auto_balance_thread.status_update.connect(self._on_autobal_status)
+        self.auto_balance_thread.finished_ok.connect(self._on_autobal_finished)
+        self.auto_balance_thread.error_occurred.connect(self._on_autobal_error)
+
+        self.monitor_start_btn.clicked.connect(self.start_live_monitor)
+        self.monitor_stop_btn.clicked.connect(self.stop_live_monitor)
+        self.monitor_diff_check.toggled.connect(self._on_monitor_diff_toggled)
+        self.live_monitor_thread.reading.connect(self._on_live_monitor_reading)
+        self.live_monitor_thread.error_occurred.connect(self._on_live_monitor_error)
+        self.live_monitor_thread.finished_monitor.connect(self._on_live_monitor_finished)
 
         self.acquisition_thread.data_received.connect(self.update_display)
         self.acquisition_thread.progress_update.connect(self.update_progress)
@@ -2055,6 +2703,11 @@ class LockInControlWidget(QWidget):
         oe = idx in (1, 2)
         self.oe_snap_samples_spin.setEnabled(oe)
         self.oe_snap_duration_spin.setEnabled(oe)
+        # 调平输出上限：苏黎世 10 V，OE1300 5 V
+        vmax = 10.0 if zurich else 5.0
+        self.autobal_coarse_v_spin.setMaximum(vmax)
+        if self.autobal_coarse_v_spin.value() > vmax:
+            self.autobal_coarse_v_spin.setValue(vmax)
 
     def connect_device(self):
         idx = self.lockin_type_combo.currentIndex()
@@ -2091,7 +2744,468 @@ class LockInControlWidget(QWidget):
             self.status_label.setStyleSheet("QLabel { color: red; }")
             QMessageBox.critical(self, "连接失败", str(e))
 
+    def _refresh_balance_ports(self):
+        current = self.balance_port_combo.currentText().strip()
+        self.balance_port_combo.clear()
+        ports = list_serial_ports()
+        if ports:
+            self.balance_port_combo.addItems(ports)
+        if current:
+            idx = self.balance_port_combo.findText(current)
+            if idx >= 0:
+                self.balance_port_combo.setCurrentIndex(idx)
+            else:
+                self.balance_port_combo.setEditText(current)
+        elif not ports:
+            self.balance_port_combo.setEditText("COM3")
+
+    def _toggle_balance_connection(self):
+        if self.balance_resistor.connected:
+            self.balance_resistor.disconnect()
+            self.balance_connect_btn.setText("连接")
+            self.balance_set_btn.setEnabled(False)
+            self.balance_status_label.setText("未连接")
+            self.balance_status_label.setStyleSheet("QLabel { color: #888; }")
+            return
+        if not BALANCE_SERIAL_AVAILABLE:
+            QMessageBox.critical(self, "无法连接", "未安装 pyserial，请先执行: pip install pyserial")
+            return
+        port = self.balance_port_combo.currentText().strip()
+        if not port:
+            QMessageBox.warning(self, "提示", "请选择或填写串口。")
+            return
+        try:
+            baud = int(self.balance_baud_combo.currentText())
+            self.balance_resistor.connect(port, baudrate=baud)
+            self.balance_connect_btn.setText("断开")
+            self.balance_set_btn.setEnabled(True)
+            self.balance_status_label.setText(f"已连 {port}")
+            self.balance_status_label.setStyleSheet("QLabel { color: green; }")
+        except Exception as e:
+            self.balance_status_label.setText("连接失败")
+            self.balance_status_label.setStyleSheet("QLabel { color: red; }")
+            QMessageBox.critical(self, "调平电阻连接失败", str(e))
+
+    def _apply_balance_status(self, st):
+        def _fmt(v, digits=3):
+            return "—" if v is None else f"{v:.{digits}f}"
+
+        self.balance_sp_label.setText(_fmt(st.sp_ohm, 3))
+        self.balance_pv_label.setText(_fmt(st.pv_ohm, 3))
+        self.balance_tamb_label.setText(_fmt(st.tamb_c, 2))
+        self._balance_umax_v = st.umax_v
+        if st.umax_v is None:
+            self.balance_umax_label.setText("—")
+        else:
+            self.balance_umax_label.setText(f"{st.umax_v:.3f} V")
+        self._update_balance_voltage_warning()
+
+    def _update_balance_voltage_warning(self):
+        """UMax 限制的是 1ω 信号，不是锁相输出电压。"""
+        umax = self._balance_umax_v
+        if umax is None:
+            self.balance_voltage_warn_label.setText("")
+            self.balance_umax_label.setStyleSheet(
+                "QLabel { font-weight: bold; color: #E65100; }"
+            )
+            return
+        target_v1 = float(self.autobal_target_v1_spin.value())
+        if target_v1 > umax + 1e-9:
+            self.balance_voltage_warn_label.setText(
+                f"⚠ 目标1ω {target_v1:.3f} V 超过 UMax={umax:.3f} V"
+                f"（UMax 限制的是 1ω，不是锁相输出）"
+            )
+            self.balance_voltage_warn_label.setStyleSheet(
+                "QLabel { color: #C62828; font-weight: bold; font-size: 11px; }"
+            )
+            self.balance_umax_label.setStyleSheet(
+                "QLabel { font-weight: bold; color: #C62828; }"
+            )
+        else:
+            self.balance_voltage_warn_label.setText(
+                f"UMax={umax:.3f} V 为 1ω 上限；目标1ω {target_v1:.3f} V ≤ UMax"
+            )
+            self.balance_voltage_warn_label.setStyleSheet(
+                "QLabel { color: #2E7D32; font-weight: normal; font-size: 11px; }"
+            )
+            self.balance_umax_label.setStyleSheet(
+                "QLabel { font-weight: bold; color: #E65100; }"
+            )
+
+    def _set_balance_resistance(self):
+        if not self.balance_resistor.connected:
+            QMessageBox.warning(self, "提示", "请先连接调平电阻。")
+            return
+        ohms = float(self.balance_res_spin.value())
+        try:
+            st = self.balance_resistor.set_resistance(ohms)
+            self._apply_balance_status(st)
+            if st.sp_ohm is not None:
+                self.balance_res_spin.setValue(st.sp_ohm)
+            msg = "下发成功。" if st.ok else "已收到回读，但未检测到 +OK。"
+            detail = "\n".join(st.raw_lines) if st.raw_lines else "(无行解析)"
+            umax_txt = "—" if st.umax_v is None else f"{st.umax_v:.3f} V"
+            QMessageBox.information(
+                self, "调平电阻",
+                f"{msg}\n1ω 上限 UMax = {umax_txt}\n"
+                f"（注意：UMax 限制的是锁到的 1ω，不是锁相输出电压）\n\n回读:\n{detail}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "下发失败", str(e))
+
+    def _check_target_v1_vs_umax(self) -> bool:
+        """若目标 1ω 超过 UMax，询问是否继续。返回 True 表示允许继续。"""
+        umax = self._balance_umax_v
+        if umax is None:
+            return True
+        target_v1 = float(self.autobal_target_v1_spin.value())
+        if target_v1 <= umax + 1e-9:
+            return True
+        reply = QMessageBox.warning(
+            self, "目标1ω超过 UMax",
+            f"目标1ω {target_v1:.3f} V 超过数控电阻回读的 UMax={umax:.3f} V。\n\n"
+            f"UMax 限制的是 1ω 信号幅值（不是锁相输出）。\n"
+            f"自动调平会把定标目标钳到 UMax。是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _current_lockin_backend_params(self):
+        """返回 (backend, oe_tcp_host, oe_tcp_port, oe_serial, oe_irng)。"""
+        lt = self.lockin_type_combo.currentIndex()
+        if lt == 0:
+            return 'zurich', '192.168.1.1', 10001, 'COM3', None
+        oe_irng = self.oe_irng_spin.value() if self.oe_irng_spin.value() >= 0 else None
+        if lt == 1:
+            return (
+                'oe1300_tcp',
+                self.oe_host_input.text().strip(),
+                self.oe_port_spin.value(),
+                'COM3',
+                oe_irng,
+            )
+        return (
+            'oe1300_serial',
+            '192.168.1.1',
+            10001,
+            self.oe_serial_input.text().strip(),
+            oe_irng,
+        )
+
+    def _set_autobal_ui_running(self, running: bool) -> None:
+        self.autobal_start_btn.setEnabled(not running)
+        self.autobal_stop_btn.setEnabled(running)
+        self.start_btn.setEnabled(not running)
+        self.balance_connect_btn.setEnabled(not running)
+        self.balance_set_btn.setEnabled(not running and self.balance_resistor.connected)
+        self.monitor_start_btn.setEnabled(not running and not self.live_monitor_thread.isRunning())
+
+    def _fmt_monitor_line(self, tag: str, amp, phase, x, y) -> str:
+        def _u(v):
+            if v is None:
+                return "—"
+            v = float(v)
+            if abs(v) >= 1e-3:
+                return f"{v * 1e3:.4f} mV"
+            return f"{v * 1e6:.2f} μV"
+
+        a = _u(amp)
+        p = "—" if phase is None else f"{float(phase):.2f}°"
+        xs = _u(x)
+        ys = _u(y)
+        return f"{tag}: |V|={a}  φ={p}  X={xs}  Y={ys}"
+
+    def _update_diff_state_label(self, on: bool) -> None:
+        if on:
+            self.monitor_diff_state_label.setText("差分: 开")
+            self.monitor_diff_state_label.setStyleSheet(
+                "QLabel { font-weight: bold; font-size: 15px; color: #2E7D32; }"
+            )
+        else:
+            self.monitor_diff_state_label.setText("差分: 关")
+            self.monitor_diff_state_label.setStyleSheet(
+                "QLabel { font-weight: bold; font-size: 15px; color: #EF6C00; }"
+            )
+
+    def _on_monitor_diff_toggled(self, checked: bool):
+        self._monitor_diff_on = bool(checked)
+        self._update_diff_state_label(checked)
+        if self.live_monitor_thread.isRunning():
+            self.live_monitor_thread.set_diff(checked)
+            self.monitor_status_label.setText(
+                f"监视中… 正在切换差分 → {'开' if checked else '关'}"
+            )
+
+    def start_live_monitor(self):
+        if self.acquisition_thread.isRunning():
+            QMessageBox.warning(self, "提示", "请先停止扫频测量。")
+            return
+        if self.auto_balance_thread.isRunning():
+            QMessageBox.warning(self, "提示", "请先停止自动调平。")
+            return
+        if self.live_monitor_thread.isRunning():
+            return
+
+        backend, oe_host, oe_port, oe_serial, oe_irng = self._current_lockin_backend_params()
+        self.live_monitor_thread.setup(
+            lockin_backend=backend,
+            device_id=self.device_id_input.text().strip(),
+            zi_host=self.zi_host_input.text().strip(),
+            zi_port=self.zi_port_spin.value(),
+            oe_tcp_host=oe_host,
+            oe_tcp_port=oe_port,
+            oe_serial_port=oe_serial,
+            oe_input_range_index=oe_irng,
+            freq_hz=float(self.monitor_freq_spin.value()),
+            output_v=float(self.output_voltage.value()),
+            diff_on=self.monitor_diff_check.isChecked(),
+            interval_s=float(self.monitor_interval_spin.value()),
+            oe_snap_n_samples=max(2, min(8, self.oe_snap_samples_spin.value())),
+            oe_snap_duration=min(0.6, float(self.oe_snap_duration_spin.value())),
+        )
+        self.monitor_start_btn.setEnabled(False)
+        self.monitor_stop_btn.setEnabled(True)
+        self.start_btn.setEnabled(False)
+        self.autobal_start_btn.setEnabled(False)
+        self.monitor_status_label.setText("正在连接锁相并监视…")
+        self.live_monitor_thread.start()
+
+    def stop_live_monitor(self):
+        if self.live_monitor_thread.isRunning():
+            self.live_monitor_thread.stop()
+            self.monitor_status_label.setText("正在停止监视…")
+
+    def _on_live_monitor_reading(self, info: dict):
+        self.monitor_v1_label.setText(self._fmt_monitor_line(
+            "1ω", info.get('v1_amp'), info.get('v1_phase'),
+            info.get('v1_x'), info.get('v1_y'),
+        ))
+        self.monitor_v3_label.setText(self._fmt_monitor_line(
+            "3ω", info.get('v3_amp'), info.get('v3_phase'),
+            info.get('v3_x'), info.get('v3_y'),
+        ))
+        diff_on = bool(info.get('diff_on', True))
+        self._update_diff_state_label(diff_on)
+        # 避免循环触发：仅在不一致时同步勾选框
+        if self.monitor_diff_check.isChecked() != diff_on:
+            self.monitor_diff_check.blockSignals(True)
+            self.monitor_diff_check.setChecked(diff_on)
+            self.monitor_diff_check.blockSignals(False)
+        self.monitor_status_label.setText(
+            f"监视中 f={float(info.get('freq_hz', 0)):.1f} Hz, "
+            f"输出={float(info.get('output_v', 0)):.3f} V"
+        )
+
+    def _on_live_monitor_error(self, err: str):
+        self.monitor_status_label.setText(f"监视失败: {err}")
+        QMessageBox.critical(self, "实时监视失败", err)
+
+    def _on_live_monitor_finished(self):
+        self.monitor_start_btn.setEnabled(
+            not self.acquisition_thread.isRunning()
+            and not self.auto_balance_thread.isRunning()
+        )
+        self.monitor_stop_btn.setEnabled(False)
+        self.start_btn.setEnabled(not self.auto_balance_thread.isRunning())
+        self.autobal_start_btn.setEnabled(not self.acquisition_thread.isRunning())
+        if "失败" not in (self.monitor_status_label.text() or ""):
+            self.monitor_status_label.setText("监视已停止")
+
+    def start_auto_balance(self):
+        if self.acquisition_thread.isRunning():
+            QMessageBox.warning(self, "提示", "请先停止正在进行的测量。")
+            return
+        if self.auto_balance_thread.isRunning():
+            QMessageBox.warning(self, "提示", "自动调平已在进行中。")
+            return
+        if self.live_monitor_thread.isRunning():
+            QMessageBox.warning(self, "提示", "请先停止实时监视（锁相连接冲突）。")
+            return
+        if not self.balance_resistor.connected:
+            QMessageBox.warning(self, "提示", "请先连接数控调平电阻。")
+            return
+
+        coarse_v = float(self.autobal_coarse_v_spin.value())
+        if not self._check_target_v1_vs_umax():
+            return
+
+        backend, oe_host, oe_port, oe_serial, oe_irng = self._current_lockin_backend_params()
+        r_min = float(self.autobal_r_min_spin.value())
+        r_max = float(self.autobal_r_max_spin.value())
+        if r_max <= r_min:
+            QMessageBox.warning(self, "参数错误", "电阻上限必须大于下限。")
+            return
+
+        cfg = AutoBalanceConfig(
+            lockin_backend=backend,
+            device_id=self.device_id_input.text().strip(),
+            zi_host=self.zi_host_input.text().strip(),
+            zi_port=self.zi_port_spin.value(),
+            oe_tcp_host=oe_host,
+            oe_tcp_port=oe_port,
+            oe_serial_port=oe_serial,
+            oe_input_range_index=oe_irng,
+            balance_freq_hz=float(self.autobal_freq_spin.value()),
+            coarse_output_v=coarse_v,
+            target_v1_heat_v=float(self.autobal_target_v1_spin.value()),
+            r_start_ohm=float(self.balance_res_spin.value()),
+            r_min_ohm=r_min,
+            r_max_ohm=r_max,
+            max_delta_r_ohm=float(self.autobal_step_spin.value()),
+            coarse_step_ohm=float(self.autobal_step_spin.value()),
+            min_step_ohm=max(0.0005, float(self.autobal_step_spin.value()) * 0.01),
+            diff_ok_v=float(self.autobal_diff_ok_spin.value()) * 1e-6,
+            rebalance_v=max(
+                float(self.autobal_diff_ok_spin.value()) * 2e-6,
+                800e-6,
+            ),
+            umax_v=self._balance_umax_v,
+            oe_snap_n_samples=self.oe_snap_samples_spin.value(),
+            oe_snap_duration=min(1.0, float(self.oe_snap_duration_spin.value())),
+        )
+        self.auto_balance_thread.setup(cfg, self.balance_resistor)
+        self._set_autobal_ui_running(True)
+        self.autobal_msg_label.setText("正在自动调平…")
+        self.progress_label.setText("自动调平进行中")
+        self.auto_balance_thread.start()
+
+    def stop_auto_balance(self):
+        if self.auto_balance_thread.isRunning():
+            self.auto_balance_thread.stop()
+            self.autobal_msg_label.setText("正在停止自动调平…")
+
+    def _on_autobal_status(self, info: dict):
+        phase = info.get("phase") or "—"
+        msg = info.get("message") or ""
+        self.autobal_phase_label.setText(
+            f"阶段: {phase}" + (f"  |  {msg}" if msg else "")
+        )
+        if msg:
+            self.autobal_msg_label.setText(msg)
+            self.progress_label.setText(f"自动调平: {msg}")
+
+        r = info.get("resistance_ohm")
+        if r is not None:
+            self.autobal_r_live_label.setText(f"{float(r):.6g} Ω")
+            self.balance_res_spin.blockSignals(True)
+            self.balance_res_spin.setValue(float(r))
+            self.balance_res_spin.blockSignals(False)
+            self.balance_sp_label.setText(f"{float(r):.3f}")
+
+        diff_on = info.get("diff_on")
+        if diff_on is None:
+            self.autobal_diff_live_label.setText("—")
+        elif diff_on:
+            self.autobal_diff_live_label.setText("开 (差分)")
+            self.autobal_diff_live_label.setStyleSheet(
+                "QLabel { font-weight: bold; font-size: 13px; color: #2E7D32; }"
+            )
+            self._update_diff_state_label(True)
+            if not self.live_monitor_thread.isRunning():
+                self.monitor_diff_check.blockSignals(True)
+                self.monitor_diff_check.setChecked(True)
+                self.monitor_diff_check.blockSignals(False)
+        else:
+            self.autobal_diff_live_label.setText("关 (单端)")
+            self.autobal_diff_live_label.setStyleSheet(
+                "QLabel { font-weight: bold; font-size: 13px; color: #EF6C00; }"
+            )
+            self._update_diff_state_label(False)
+            if not self.live_monitor_thread.isRunning():
+                self.monitor_diff_check.blockSignals(True)
+                self.monitor_diff_check.setChecked(False)
+                self.monitor_diff_check.blockSignals(False)
+
+        v1 = info.get("v1_amp")
+        if v1 is None:
+            self.autobal_v1_live_label.setText("—")
+            self.autobal_v1_live_label.setStyleSheet(
+                "QLabel { font-weight: bold; color: #1565C0; }"
+            )
+        else:
+            v1 = float(v1)
+            if v1 >= 1e-3:
+                self.autobal_v1_live_label.setText(f"{v1 * 1e3:.3f} mV")
+            else:
+                self.autobal_v1_live_label.setText(f"{v1 * 1e6:.1f} μV")
+            umax = self._balance_umax_v
+            if umax is not None and v1 > umax + 1e-9:
+                self.autobal_v1_live_label.setStyleSheet(
+                    "QLabel { font-weight: bold; color: #C62828; }"
+                )
+            else:
+                self.autobal_v1_live_label.setStyleSheet(
+                    "QLabel { font-weight: bold; color: #1565C0; }"
+                )
+            # 调平过程中同步右侧监视条（无独立 3ω 时只更新 1ω）
+            if not self.live_monitor_thread.isRunning():
+                self.monitor_v1_label.setText(self._fmt_monitor_line(
+                    "1ω", v1, info.get("v1_phase"), info.get("v1_x"), None
+                ))
+                self.monitor_status_label.setText("显示来自自动调平读数")
+
+        vout = info.get("output_v")
+        if vout is not None:
+            self.autobal_vout_live_label.setText(f"{float(vout):.4f} V")
+
+        umax = info.get("umax_v")
+        if umax is not None:
+            self._balance_umax_v = float(umax)
+            self.balance_umax_label.setText(f"{float(umax):.3f} V")
+            self._update_balance_voltage_warning()
+
+    def _on_autobal_finished(self, result: dict):
+        self._set_autobal_ui_running(False)
+        r = result.get("r_ohm")
+        vout = result.get("output_v")
+        v1d = result.get("v1_diff")
+        if r is not None:
+            self.balance_res_spin.setValue(float(r))
+            self.balance_sp_label.setText(f"{float(r):.3f}")
+            self.autobal_r_live_label.setText(f"{float(r):.6g} Ω")
+        if vout is not None:
+            self.output_voltage.setValue(float(vout))
+            self.autobal_vout_live_label.setText(f"{float(vout):.4f} V")
+        if v1d is not None:
+            self.autobal_v1_live_label.setText(f"{float(v1d) * 1e6:.1f} μV")
+            self.autobal_diff_live_label.setText("开 (差分)")
+            self.autobal_diff_live_label.setStyleSheet(
+                "QLabel { font-weight: bold; font-size: 13px; color: #2E7D32; }"
+            )
+
+        msg = result.get("message") or "自动调平结束"
+        self.autobal_msg_label.setText(msg)
+        self.progress_label.setText("自动调平结束")
+        if result.get("ok"):
+            if r is not None and vout is not None and v1d is not None:
+                detail = (
+                    f"{msg}\n\n"
+                    f"电阻: {float(r):.6g} Ω\n"
+                    f"测量用输出电压已更新为: {float(vout):.4f} V\n"
+                    f"差分1ω: {float(v1d) * 1e6:.1f} μV\n\n"
+                    f"可点击「开始测量」。"
+                )
+            else:
+                detail = msg
+            QMessageBox.information(self, "自动调平完成", detail)
+        else:
+            QMessageBox.warning(self, "自动调平未完全达标", msg)
+
+    def _on_autobal_error(self, err: str):
+        self._set_autobal_ui_running(False)
+        self.autobal_msg_label.setText(f"失败: {err}")
+        self.progress_label.setText("自动调平失败")
+        QMessageBox.critical(self, "自动调平失败", err)
+
     def start_measurement(self):
+        if self.auto_balance_thread.isRunning():
+            QMessageBox.warning(self, "提示", "请先停止自动调平。")
+            return
+        if self.live_monitor_thread.isRunning():
+            QMessageBox.warning(self, "提示", "请先停止实时监视（锁相连接冲突）。")
+            return
+
         # 生成频率列表
         start = self.freq_start.value()
         end = self.freq_end.value()
@@ -2144,17 +3258,34 @@ class LockInControlWidget(QWidget):
         # 启动测量
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.monitor_start_btn.setEnabled(False)
+        self.autobal_start_btn.setEnabled(False)
         self.acquisition_thread.start()
 
     def stop_measurement(self):
         self.acquisition_thread.stop()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.monitor_start_btn.setEnabled(True)
+        self.autobal_start_btn.setEnabled(True)
 
     def update_display(self, data):
         # 存仪器原始值；表格/曲线按「信号缩放倍数」显示
         self.collected_data.append(data)
         self._refresh_plots_and_table_from_collected()
+        if not self.live_monitor_thread.isRunning():
+            s = self._scaled_data_row(data)
+            self.monitor_v1_label.setText(
+                f"1ω: |V|={s['v1_amp']:.6e} V  φ={s['v1_phase']:.2f}°"
+            )
+            self.monitor_v3_label.setText(
+                f"3ω: |V|={s['v3_amp']:.6e} V  φ={s['v3_phase']:.2f}°  "
+                f"X={s['v3_real']:.6e}  Y={s['v3_imag']:.6e}"
+            )
+            self._update_diff_state_label(True)
+            self.monitor_status_label.setText(
+                f"扫频中 f={s['frequency']:.2f} Hz（差分开）"
+            )
 
     def update_progress(self, value, message):
         self.progress_bar.setValue(value)
@@ -2164,10 +3295,14 @@ class LockInControlWidget(QWidget):
         QMessageBox.critical(self, "错误", f"测量过程中出现错误:\n{error_msg}")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.monitor_start_btn.setEnabled(True)
+        self.autobal_start_btn.setEnabled(True)
 
     def measurement_finished(self):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.monitor_start_btn.setEnabled(True)
+        self.autobal_start_btn.setEnabled(True)
         QMessageBox.information(self, "完成", "数据采集完成！")
 
     def save_data(self):
@@ -2181,10 +3316,23 @@ class LockInControlWidget(QWidget):
         )
 
         if filename:
+            if not filename.lower().endswith(('.xlsx', '.xlsm')):
+                filename = filename + '.xlsx'
             scaled_rows = [self._scaled_data_row(d) for d in self.collected_data]
             df = pd.DataFrame(scaled_rows)
-            df.to_excel(filename, index=False)
-            QMessageBox.information(self, "成功", f"数据已保存到:\n{filename}")
+            model_config = None
+            if self._fitting_source is not None and hasattr(self._fitting_source, 'get_model_config'):
+                try:
+                    model_config = self._fitting_source.get_model_config()
+                except Exception:
+                    model_config = None
+            wrote_meta = save_dataframe_with_model_config(filename, df, model_config)
+            extra = (
+                "\n已同时写入「数据拟合」当前传感器参数与材料层参数（Sensor / Layers 工作表）。"
+                if wrote_meta else
+                "\n（未写入模型参数：请先在数据拟合页设置参数，或检查是否保存为 .xlsx）"
+            )
+            QMessageBox.information(self, "成功", f"数据已保存到:\n{filename}{extra}")
 
 
 class FittingWidget(QWidget):
@@ -2200,7 +3348,20 @@ class FittingWidget(QWidget):
         self._calibrator = None
         self._fit_cancel_requested = False
         self._last_fitted_param_spec = None
+        self._lockin_source = None
+        self.point_keep_mask = None  # True=保留，与 fitting_data 行对齐
+        self._auto_suggest_exclude = None  # 自动检测建议剔除的原始行索引
+        self._preview_handler = None
+        self._point_table_block = False
         self.init_ui()
+
+    def set_lockin_source(self, lockin_widget):
+        """关联锁相控制页，用于同步调平电阻与目标1ω。"""
+        self._lockin_source = lockin_widget
+
+    def set_preview_handler(self, handler):
+        """加载/剔点后调用。handler(freqs_all, V3_all, keep_mask, range_mask)。"""
+        self._preview_handler = handler
 
     def set_calibrator(self, calibrator):
         """设置信号校正器（由主窗口传入）"""
@@ -2226,7 +3387,87 @@ class FittingWidget(QWidget):
                 if param in w['inputs']:
                     layer[param] = w['inputs'][param].text().strip()
             layers.append(layer)
-        return {'sensor': sensor, 'layers': layers}
+        cfg = {'sensor': sensor, 'layers': layers}
+        fr = self.get_frequency_range()
+        if fr:
+            cfg['frequency_range'] = fr
+        return cfg
+
+    def get_frequency_range(self):
+        """当前拟合用频率筛选范围（若已启用）。"""
+        if not hasattr(self, 'freq_min_selector') or not hasattr(self, 'freq_max_selector'):
+            return None
+        if not (self.freq_min_selector.isEnabled() and self.freq_max_selector.isEnabled()):
+            # 仍记录当前值，便于导出
+            try:
+                return {
+                    'min_hz': float(self.freq_min_selector.value()),
+                    'max_hz': float(self.freq_max_selector.value()),
+                    'filter_enabled': False,
+                }
+            except Exception:
+                return None
+        return {
+            'min_hz': float(self.freq_min_selector.value()),
+            'max_hz': float(self.freq_max_selector.value()),
+            'filter_enabled': True,
+        }
+
+    def apply_model_config(self, config, apply_frequency_range=False):
+        """将传感器/材料层配置写回界面。
+
+        apply_frequency_range: 是否应用文件中保存的频率筛选。
+        导入新数据时应为 False，始终以数据实际频率范围为准。
+        """
+        if not config:
+            return
+        sensor = sensor_dict_for_ui(config.get('sensor') or {})
+        for param, value in sensor.items():
+            if param in self.sensor_inputs:
+                self.sensor_inputs[param].setText(str(value))
+
+        layers = config.get('layers') or []
+        if layers:
+            # 调整层数
+            while len(self.layer_widgets) > len(layers):
+                if len(self.layer_widgets) <= 1:
+                    break
+                w = self.layer_widgets.pop()
+                self.layers_layout.removeWidget(w['container'])
+                w['container'].deleteLater()
+                self._renumber_layer_widgets()
+            while len(self.layer_widgets) < len(layers):
+                self.add_layer_widget(len(self.layer_widgets))
+
+            for i, layer_data in enumerate(layers):
+                if i >= len(self.layer_widgets):
+                    break
+                for param, value in layer_data.items():
+                    if param in self.layer_widgets[i]['inputs']:
+                        self.layer_widgets[i]['inputs'][param].setText(str(value))
+            self._sync_tc_range()
+
+        fr = config.get('frequency_range') or {}
+        if apply_frequency_range and fr and hasattr(self, 'freq_min_selector'):
+            try:
+                fmin = float(fr.get('min_hz'))
+                fmax = float(fr.get('max_hz'))
+                if fmin > 0 and fmax >= fmin:
+                    for widget in (self.freq_min_selector, self.freq_max_selector):
+                        widget.blockSignals(True)
+                    # 扩展可选范围以容纳保存的值
+                    cur_lo = self.freq_min_selector.minimum()
+                    cur_hi = self.freq_max_selector.maximum()
+                    self.freq_min_selector.setRange(min(cur_lo, fmin), max(cur_hi, fmax))
+                    self.freq_max_selector.setRange(min(cur_lo, fmin), max(cur_hi, fmax))
+                    self.freq_min_selector.setValue(fmin)
+                    self.freq_max_selector.setValue(fmax)
+                    self.freq_min_selector.setEnabled(True)
+                    self.freq_max_selector.setEnabled(True)
+                    for widget in (self.freq_min_selector, self.freq_max_selector):
+                        widget.blockSignals(False)
+            except Exception:
+                pass
 
     def _set_last_fitted_param_spec(self, params_to_fit, thickness_gui_layers=None):
         """记录本次拟合实际参与的参数（用于结果表，不依赖事后复选框状态）。"""
@@ -2292,6 +3533,32 @@ class FittingWidget(QWidget):
             }, 'combined'
         return [l.copy() for l in fitter.layers[::-1]], 'material'
 
+    @staticmethod
+    def _sensor_result_display(param, value, sensor_params):
+        """模型传感器结果 → 界面显示名与数值（dR_dT 显示为 α_R）。"""
+        if param == 'dR_dT':
+            try:
+                R = float(sensor_params.get('R', 0) or 0)
+                alpha = float(value) / R if R else float('nan')
+            except (TypeError, ValueError, ZeroDivisionError):
+                alpha = float('nan')
+            return 'α_R (/K)', alpha
+        return param, value
+
+    def _sync_gui_alpha_from_model_sensor(self, sensor_params):
+        """拟合后把模型 dR_dT 写回界面 α_R（并更新其它传感器框）。"""
+        if not sensor_params:
+            return
+        try:
+            ui = sensor_dict_for_ui(sensor_params)
+            for k, v in ui.items():
+                if k in self.sensor_inputs:
+                    self.sensor_inputs[k].setText(
+                        f"{float(v):.6e}" if isinstance(v, (int, float, np.floating)) else str(v)
+                    )
+        except Exception:
+            pass
+
     def _display_fitted_result(self, fitted_result, result_kind, cancelled=False):
         """在结果区展示拟合/中止后的参数。"""
         if cancelled:
@@ -2302,20 +3569,25 @@ class FittingWidget(QWidget):
         if result_kind == 'sensor':
             self.results_text.append("拟合的传感器参数:")
             for param, value in fitted_result.items():
-                self.results_text.append(f"  {param}: {value:.6e}")
+                name, disp = self._sensor_result_display(param, value, fitted_result)
+                self.results_text.append(f"  {name}: {disp:.6e}")
+            self._sync_gui_alpha_from_model_sensor(fitted_result)
         elif result_kind == 'combined':
             self.results_text.append("拟合的传感器参数:")
-            for param, value in fitted_result['sensor_params'].items():
-                self.results_text.append(f"  {param}: {value:.6e}")
+            sp = fitted_result['sensor_params']
+            for param, value in sp.items():
+                name, disp = self._sensor_result_display(param, value, sp)
+                self.results_text.append(f"  {name}: {disp:.6e}")
+            self._sync_gui_alpha_from_model_sensor(sp)
             self.results_text.append("\n拟合的材料参数:")
             for i, layer in enumerate(fitted_result['layers']):
-                self.results_text.append(f"\n第 {i + 1} 层 (GUI Layer {i}):")
+                self.results_text.append(f"\n第 {i + 1} 层:")
                 for param, value in layer.items():
                     self.results_text.append(f"  {param}: {value:.6e}")
         else:
             self.results_text.append("拟合的材料参数:")
             for i, layer in enumerate(fitted_result):
-                self.results_text.append(f"\n第 {i} 层:")
+                self.results_text.append(f"\n第 {i + 1} 层:")
                 for param, value in layer.items():
                     self.results_text.append(f"  {param}: {value:.6e}")
 
@@ -2365,17 +3637,24 @@ class FittingWidget(QWidget):
         freq_layout = QGridLayout()
         freq_layout.addWidget(QLabel("最小频率 (Hz):"), 0, 0)
         self.freq_min_selector = QDoubleSpinBox()
-        self.freq_min_selector.setDecimals(3)
+        self.freq_min_selector.setDecimals(6)
         self.freq_min_selector.setRange(0.0, 1e8)
         self.freq_min_selector.setEnabled(False)
         freq_layout.addWidget(self.freq_min_selector, 0, 1)
 
         freq_layout.addWidget(QLabel("最大频率 (Hz):"), 1, 0)
         self.freq_max_selector = QDoubleSpinBox()
-        self.freq_max_selector.setDecimals(3)
+        self.freq_max_selector.setDecimals(6)
         self.freq_max_selector.setRange(0.0, 1e8)
         self.freq_max_selector.setEnabled(False)
         freq_layout.addWidget(self.freq_max_selector, 1, 1)
+
+        self.fit_points_label = QLabel("最终参与拟合: —")
+        self.fit_points_label.setStyleSheet("QLabel { color: #1565C0; font-weight: bold; }")
+        self.fit_points_label.setToolTip(
+            "频率筛选与数据点剔除取交集后，实际进入拟合的点数。"
+        )
+        freq_layout.addWidget(self.fit_points_label, 2, 0, 1, 2)
 
         self.freq_min_selector.valueChanged.connect(self.on_freq_min_changed)
         self.freq_max_selector.valueChanged.connect(self.on_freq_max_changed)
@@ -2406,6 +3685,10 @@ class FittingWidget(QWidget):
         self.joint_datasets_widget = self.create_joint_datasets_widget()
         self.param_tabs.addTab(self.joint_datasets_widget, "联合拟合数据集")
 
+        # 数据点剔除
+        self.point_exclude_widget = self.create_point_exclude_widget()
+        self.param_tabs.addTab(self.point_exclude_widget, "数据点剔除")
+
         layout.addWidget(self.param_tabs, 1)
 
         # 控制按钮
@@ -2425,7 +3708,9 @@ class FittingWidget(QWidget):
         self.export_fitted_data_btn.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; font-size: 16px; padding: 10px; }")
         self.export_fitted_data_btn.setToolTip(
-            "将拟合模型计算的 V3 数据导出为 CSV/Excel，频率与点数与导入数据一致，不含 V1 列")
+            "导出拟合模型 V3（频率/点数与导入数据一致）；"
+            "xlsx 同时写入频率范围、传感器与材料参数工作表"
+        )
         self.prefit_corr_btn = QPushButton("拟合前相关性")
         self.prefit_corr_btn.setStyleSheet(
             "QPushButton { background-color: #607D8B; color: white; font-size: 16px; padding: 10px; }")
@@ -2532,15 +3817,19 @@ class FittingWidget(QWidget):
 
         # 传感器参数输入
         self.sensor_inputs = {}
-        params = ['b', 'L', 'R', 'dR_dT', 'V_rms', 'H_e', 'rho_C_e']
-        labels = ['半宽度b (m)', '长度L (m)', '电阻R (Ω)', 'dR/dT (Ω/K)',
-                  'RMS电压 (V)', '加热器厚度H_e (m)', '热容rho_C_e (J/m³K)']
+        params = list(SENSOR_UI_PARAMS)
+        labels = list(SENSOR_UI_LABELS)
 
         for i, (param, label) in enumerate(zip(params, labels)):
             row = i + 1
             layout.addWidget(QLabel(label + ":"), row, 0)
             input_widget = QLineEdit()
             input_widget.setText("1.0e-3" if 'b' in param or 'L' in param else "1.0")
+            if param == 'alpha_R':
+                input_widget.setToolTip(
+                    "电阻温度系数 α_R (/K)。模型内部使用 dR/dT = α_R·R；"
+                    "旧 Excel Sensor 表中的 dR_dT 加载时自动换算为 α_R。"
+                )
             self.sensor_inputs[param] = input_widget
             layout.addWidget(input_widget, row, 1)
 
@@ -2566,6 +3855,19 @@ class FittingWidget(QWidget):
             max_input.setMaximumWidth(80)
             bounds_layout.addWidget(max_input)
             layout.addWidget(bounds_widget, row, 3)
+
+        # 从锁相控制页同步调平电阻 R、目标1ω → V_rms
+        sync_row = len(params) + 1
+        self.sync_from_lockin_btn = QPushButton("从锁相同步：调平电阻→R，目标1ω→RMS电压")
+        self.sync_from_lockin_btn.setStyleSheet(
+            "QPushButton { background-color: #00897B; color: white; padding: 4px; }"
+        )
+        self.sync_from_lockin_btn.setToolTip(
+            "读取「锁相控制」页：数控电阻设定值写入电阻 R；"
+            "自动调平「目标1ω」写入 RMS 电压 V_rms"
+        )
+        self.sync_from_lockin_btn.clicked.connect(self.sync_sensor_from_lockin)
+        layout.addWidget(self.sync_from_lockin_btn, sync_row, 0, 1, 4)
 
         widget.setLayout(layout)
         return widget
@@ -2834,6 +4136,32 @@ class FittingWidget(QWidget):
             if param in self.sensor_inputs:
                 self.sensor_inputs[param].setText(f"{value:.3e}")
 
+    def sync_sensor_from_lockin(self):
+        """将锁相页调平电阻→R、目标1ω→V_rms 同步到传感器参数。"""
+        src = self._lockin_source
+        if src is None:
+            QMessageBox.warning(self, "提示", "未关联锁相控制页，无法同步。")
+            return
+        try:
+            r_ohm = float(src.balance_res_spin.value())
+            v_rms = float(src.autobal_target_v1_spin.value())
+        except Exception as e:
+            QMessageBox.warning(self, "同步失败", f"读取锁相参数失败:\n{e}")
+            return
+
+        if 'R' not in self.sensor_inputs or 'V_rms' not in self.sensor_inputs:
+            QMessageBox.warning(self, "提示", "传感器参数中缺少 R 或 V_rms 输入框。")
+            return
+
+        self.sensor_inputs['R'].setText(f"{r_ohm:.6g}")
+        self.sensor_inputs['V_rms'].setText(f"{v_rms:.6g}")
+        QMessageBox.information(
+            self, "同步成功",
+            f"已从锁相控制同步到传感器参数：\n"
+            f"  电阻 R = {r_ohm:.6g} Ω（调平电阻设定）\n"
+            f"  RMS电压 V_rms = {v_rms:.6g} V（目标1ω）",
+        )
+
     def _update_tc_pair_label(self, *args):
         """更新总厚度约束所作用层对的提示文字"""
         if hasattr(self, 'tc_pair_label') and hasattr(self, 'tc_upper'):
@@ -2878,6 +4206,67 @@ class FittingWidget(QWidget):
         layout.setRowStretch(3, 1)
 
         widget.setLayout(layout)
+        return widget
+
+    def create_point_exclude_widget(self):
+        """手动勾选 + 自动检测异常点。"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        tip = QLabel(
+            "导入后默认全部保留，不会自动剔除。"
+            "手动：取消勾选「保留」；自动：先点「自动检测异常」，核对后再点「应用检测结果」。"
+            "应用后会同步收紧上方「频率筛选」范围，并更新最终拟合点数。"
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("QLabel { color: #555; font-size: 11px; }")
+        layout.addWidget(tip)
+
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("自动阈值 k·MAD:"))
+        self.outlier_k_spin = QDoubleSpinBox()
+        self.outlier_k_spin.setRange(2.0, 8.0)
+        self.outlier_k_spin.setDecimals(1)
+        self.outlier_k_spin.setSingleStep(0.5)
+        self.outlier_k_spin.setValue(3.5)
+        self.outlier_k_spin.setToolTip("越大越保守；建议 3～4")
+        ctrl.addWidget(self.outlier_k_spin)
+
+        self.detect_outlier_btn = QPushButton("自动检测异常")
+        self.detect_outlier_btn.clicked.connect(self.detect_outliers_auto)
+        ctrl.addWidget(self.detect_outlier_btn)
+
+        self.apply_outlier_btn = QPushButton("应用检测结果")
+        self.apply_outlier_btn.clicked.connect(self.apply_auto_exclude)
+        self.apply_outlier_btn.setEnabled(False)
+        ctrl.addWidget(self.apply_outlier_btn)
+
+        self.restore_points_btn = QPushButton("全部保留")
+        self.restore_points_btn.clicked.connect(self.restore_all_points)
+        ctrl.addWidget(self.restore_points_btn)
+
+        self.preview_points_btn = QPushButton("预览到可视化")
+        self.preview_points_btn.setStyleSheet(
+            "QPushButton { background-color: #0277BD; color: white; }"
+        )
+        self.preview_points_btn.clicked.connect(lambda: self.preview_points_in_viz(True))
+        ctrl.addWidget(self.preview_points_btn)
+        ctrl.addStretch(1)
+        layout.addLayout(ctrl)
+
+        self.point_exclude_status = QLabel("尚未加载数据")
+        self.point_exclude_status.setStyleSheet("QLabel { color: #666; }")
+        layout.addWidget(self.point_exclude_status)
+
+        self.point_table = QTableWidget()
+        self.point_table.setColumnCount(5)
+        self.point_table.setHorizontalHeaderLabels(
+            ["保留", "频率 (Hz)", "|V3| (V)", "相位 (°)", "检测"]
+        )
+        self.point_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.point_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.point_table.itemChanged.connect(self._on_point_table_item_changed)
+        layout.addWidget(self.point_table)
         return widget
 
     def create_joint_datasets_widget(self):
@@ -2928,9 +4317,8 @@ class FittingWidget(QWidget):
         layout.addWidget(sensor_combo, 0, 1, 1, 2)
 
         sensor_inputs = {}
-        params = ['b', 'L', 'R', 'dR_dT', 'V_rms', 'H_e', 'rho_C_e']
-        labels = ['半宽度b (m)', '长度L (m)', '电阻R (Ω)', 'dR/dT (Ω/K)',
-                  'RMS电压 (V)', '加热器厚度H_e (m)', '热容rho_C_e (J/m³K)']
+        params = list(SENSOR_UI_PARAMS)
+        labels = list(SENSOR_UI_LABELS)
 
         for i, (param, label) in enumerate(zip(params, labels)):
             row = i + 1
@@ -2970,12 +4358,21 @@ class FittingWidget(QWidget):
             )
             if filename:
                 try:
-                    if filename.endswith('.xlsx'):
-                        df = pd.read_excel(filename)
-                    else:
-                        df = pd.read_csv(filename)
+                    df, model_config = load_dataframe_with_model_config(filename)
                     info['data'] = df
                     info['file_label'].setText(os.path.basename(filename))
+                    if model_config:
+                        # 更新该数据集传感器；材料层写回主拟合页
+                        sens = sensor_dict_for_ui(model_config.get('sensor') or {})
+                        for p, v in sens.items():
+                            if p in info['sensor_inputs']:
+                                info['sensor_inputs'][p].setText(str(v))
+                        if model_config.get('layers'):
+                            self.apply_model_config({'sensor': {}, 'layers': model_config['layers']})
+                        QMessageBox.information(
+                            self, "成功",
+                            f"已加载数据，并自动更新传感器/材料参数。\n文件: {os.path.basename(filename)}"
+                        )
                 except Exception as e:
                     QMessageBox.critical(self, "错误", f"加载失败:\n{str(e)}")
 
@@ -3050,18 +4447,23 @@ class FittingWidget(QWidget):
 
         for widget in (self.freq_min_selector, self.freq_max_selector):
             widget.blockSignals(False)
+        self._update_fit_points_label()
 
     def on_freq_min_changed(self, value):
         if self.freq_max_selector.isEnabled() and value > self.freq_max_selector.value():
             self.freq_max_selector.blockSignals(True)
             self.freq_max_selector.setValue(value)
             self.freq_max_selector.blockSignals(False)
+        self._refresh_point_table()
+        self._update_fit_points_label()
 
     def on_freq_max_changed(self, value):
         if self.freq_min_selector.isEnabled() and value < self.freq_min_selector.value():
             self.freq_min_selector.blockSignals(True)
             self.freq_min_selector.setValue(value)
             self.freq_min_selector.blockSignals(False)
+        self._refresh_point_table()
+        self._update_fit_points_label()
 
     def _append_result_row(self, category, name, value):
         """在结果表中追加一行"""
@@ -3143,11 +4545,14 @@ class FittingWidget(QWidget):
         if result_kind == 'sensor':
             for param, value in fitted_result.items():
                 if self._was_sensor_param_fitted(param):
-                    self._append_result_row("传感器参数", param, value)
+                    name, disp = self._sensor_result_display(param, value, fitted_result)
+                    self._append_result_row("传感器参数", name, disp)
         elif result_kind == 'combined':
-            for param, value in fitted_result['sensor_params'].items():
+            sp = fitted_result['sensor_params']
+            for param, value in sp.items():
                 if self._was_sensor_param_fitted(param):
-                    self._append_result_row("传感器参数", param, value)
+                    name, disp = self._sensor_result_display(param, value, sp)
+                    self._append_result_row("传感器参数", name, disp)
             for idx, layer in enumerate(fitted_result['layers']):
                 for param, value in layer.items():
                     if self._was_layer_param_fitted(idx, param):
@@ -3182,13 +4587,13 @@ class FittingWidget(QWidget):
         return layers
 
     def _collect_sensor_params_from_gui(self):
-        sensor_params = {}
-        for param, input_widget in self.sensor_inputs.items():
-            try:
-                sensor_params[param] = float(input_widget.text())
-            except Exception as exc:
-                raise ValueError(f"传感器参数 {param} 输入无效") from exc
-        return sensor_params
+        """从界面收集传感器参数，并换算为模型所需的 dR_dT。"""
+        try:
+            return sensor_dict_for_model(
+                {param: input_widget.text() for param, input_widget in self.sensor_inputs.items()}
+            )
+        except Exception as exc:
+            raise ValueError(f"传感器参数无效: {exc}") from exc
 
     def _collect_params_to_fit_from_gui(self, layers, mode, skip_h_layers=None):
         """收集 GUI 中勾选的拟合参数。skip_h_layers 为 GUI 层索引集合（厚度约束时跳过 H）。"""
@@ -3233,27 +4638,30 @@ class FittingWidget(QWidget):
         if is_sensor_only or is_combined:
             sensor_params_to_fit = []
             sensor_bounds = {}
+            try:
+                R = float(self.sensor_inputs['R'].text())
+            except Exception:
+                R = 1.0
             for param in self.sensor_inputs.keys():
                 checkbox = self.sensor_widget.findChild(QCheckBox, f"sensor_{param}_fit")
                 if checkbox and checkbox.isChecked():
-                    sensor_params_to_fit.append(param)
                     min_input = self.sensor_widget.findChild(QLineEdit, f"sensor_{param}_min")
                     max_input = self.sensor_widget.findChild(QLineEdit, f"sensor_{param}_max")
                     if (min_input and max_input and min_input.text().strip()
                             and max_input.text().strip()):
-                        sensor_bounds[param] = (
-                            float(min_input.text()),
-                            float(max_input.text()),
-                        )
+                        lo, hi = float(min_input.text()), float(max_input.text())
                     else:
                         try:
                             current_val = float(self.sensor_inputs[param].text())
                         except Exception:
                             current_val = 1.0
-                        if param == 'dR_dT':
-                            sensor_bounds[param] = (current_val * 0.1, current_val * 10)
+                        if param == 'alpha_R':
+                            lo, hi = current_val * 0.1, current_val * 10.0
                         else:
-                            sensor_bounds[param] = (current_val * 0.5, current_val * 2.0)
+                            lo, hi = current_val * 0.5, current_val * 2.0
+                    model_param, model_bounds = map_sensor_fit_ui_to_model(param, lo, hi, R)
+                    sensor_params_to_fit.append(model_param)
+                    sensor_bounds[model_param] = model_bounds
             if sensor_params_to_fit:
                 params_to_fit['sensor'] = sensor_params_to_fit
                 param_bounds['sensor'] = sensor_bounds
@@ -3291,7 +4699,9 @@ class FittingWidget(QWidget):
             V3_exp = self._parse_v3_from_dataframe(df)
             if apply_cal:
                 V3_exp = calibrator.correct_v3omega(freqs, V3_exp)
-            sp = {param: float(inp.text()) for param, inp in ds_info['sensor_inputs'].items()}
+            sp = sensor_dict_for_model(
+                {param: inp.text() for param, inp in ds_info['sensor_inputs'].items()}
+            )
             datasets.append({
                 'freqs': freqs,
                 'V3_exp': V3_exp,
@@ -3537,17 +4947,316 @@ class FittingWidget(QWidget):
 
         if filename:
             try:
-                if filename.endswith('.xlsx'):
-                    self.fitting_data = pd.read_excel(filename)
-                else:
-                    self.fitting_data = pd.read_csv(filename)
+                self.fitting_data, model_config = load_dataframe_with_model_config(filename)
 
                 self.data_file_label.setText(f"已加载: {os.path.basename(filename)}")
                 freqs = self.fitting_data.iloc[:, 0].values.astype(float)
                 self.initialize_frequency_filters(freqs)
-                QMessageBox.information(self, "成功", f"数据加载成功!\n共 {len(self.fitting_data)} 个数据点")
+                # 导入只重置为全部保留，绝不自动检测/剔除
+                self._reset_point_keep_mask()
+                self._auto_suggest_exclude = None
+                if hasattr(self, 'apply_outlier_btn'):
+                    self.apply_outlier_btn.setEnabled(False)
+                self._refresh_point_table()
+
+                meta_msg = ""
+                if model_config:
+                    # 仅恢复传感器/材料层；频率范围以本次数据为准，不用 Meta 里旧值
+                    self.apply_model_config(model_config, apply_frequency_range=False)
+                    n_s = len(model_config.get('sensor') or {})
+                    n_l = len(model_config.get('layers') or [])
+                    fr = model_config.get('frequency_range') or {}
+                    fr_txt = ""
+                    if fr.get('min_hz') is not None and fr.get('max_hz') is not None:
+                        fr_txt = (
+                            f"\n（文件中曾记录频率范围 {fr['min_hz']}–{fr['max_hz']} Hz，"
+                            f"已忽略，使用数据实际范围）"
+                        )
+                    meta_msg = f"\n已自动载入并更新传感器参数 {n_s} 项、材料层 {n_l} 层{fr_txt}。"
+
+                # 确保频率筛选 = 数据实际 min～max（覆盖任何残留设置）
+                self.initialize_frequency_filters(freqs)
+                # 再次确保载入配置后仍全部保留（不自动剔点）
+                self._reset_point_keep_mask()
+                self._refresh_point_table()
+                self.preview_points_in_viz(switch_tab=True)
+                QMessageBox.information(
+                    self, "成功",
+                    f"数据加载成功!\n共 {len(self.fitting_data)} 个数据点{meta_msg}\n"
+                    f"已在「结果可视化」中显示；可在「数据点剔除」页筛点后拟合。"
+                )
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"加载数据失败:\n{str(e)}")
+
+    def _parse_v3_arrays_from_fitting_data(self):
+        """从 fitting_data 提取全长 freqs / V3。"""
+        freqs = self.fitting_data.iloc[:, 0].values.astype(float)
+        if 'v3_real' in self.fitting_data.columns and 'v3_imag' in self.fitting_data.columns:
+            real_vals = self.fitting_data['v3_real'].values.astype(float)
+            imag_vals = self.fitting_data['v3_imag'].values.astype(float)
+        elif 'V3_Real' in self.fitting_data.columns:
+            real_vals = self.fitting_data['V3_Real'].values.astype(float)
+            imag_vals = self.fitting_data['V3_Imag'].values.astype(float)
+        else:
+            real_vals = self.fitting_data.iloc[:, 1].values.astype(float)
+            imag_vals = self.fitting_data.iloc[:, 2].values.astype(float)
+        return freqs, real_vals + 1j * imag_vals
+
+    def _reset_point_keep_mask(self):
+        if self.fitting_data is None:
+            self.point_keep_mask = None
+            self._auto_suggest_exclude = None
+            return
+        n = len(self.fitting_data)
+        self.point_keep_mask = np.ones(n, dtype=bool)
+        self._auto_suggest_exclude = None
+        if hasattr(self, 'apply_outlier_btn'):
+            self.apply_outlier_btn.setEnabled(False)
+
+    def _freq_range_mask(self, freqs):
+        use_filter = self.freq_min_selector.isEnabled() and self.freq_max_selector.isEnabled()
+        if use_filter:
+            min_freq = self.freq_min_selector.value()
+            max_freq = self.freq_max_selector.value()
+            # 容差：避免 spinbox 舍入把边界点误判到范围外
+            span = max(abs(max_freq - min_freq), abs(min_freq), abs(max_freq), 1.0)
+            eps = max(1e-12, span * 1e-9)
+            return (freqs >= min_freq - eps) & (freqs <= max_freq + eps)
+        return np.ones(freqs.shape, dtype=bool)
+
+    def _combined_keep_mask(self, freqs):
+        """频率筛选 ∩ 手动/自动剔点保留。"""
+        mask = self._freq_range_mask(freqs)
+        if self.point_keep_mask is not None and len(self.point_keep_mask) == len(freqs):
+            mask = mask & self.point_keep_mask
+        return mask
+
+    def _count_fit_points(self):
+        """返回 (总点数, 最终拟合点数, 剔点数)。"""
+        if self.fitting_data is None:
+            return 0, 0, 0
+        freqs, _ = self._parse_v3_arrays_from_fitting_data()
+        n_total = len(freqs)
+        n_fit = int(np.sum(self._combined_keep_mask(freqs)))
+        n_excl = 0
+        if self.point_keep_mask is not None and len(self.point_keep_mask) == n_total:
+            n_excl = int(np.sum(~self.point_keep_mask))
+        return n_total, n_fit, n_excl
+
+    def _update_fit_points_label(self):
+        if not hasattr(self, 'fit_points_label'):
+            return
+        if self.fitting_data is None:
+            self.fit_points_label.setText("最终参与拟合: —")
+            return
+        n_total, n_fit, n_excl = self._count_fit_points()
+        freqs, _ = self._parse_v3_arrays_from_fitting_data()
+        in_range = self._freq_range_mask(freqs)
+        n_out_range = int(np.sum(~in_range))
+        parts = [f"最终参与拟合: {n_fit} / {n_total} 点"]
+        if n_excl > 0:
+            parts.append(f"剔除 {n_excl}")
+        if n_out_range > 0:
+            parts.append(f"范围外 {n_out_range}")
+        self.fit_points_label.setText(
+            parts[0] if len(parts) == 1 else parts[0] + f"（{'，'.join(parts[1:])}）"
+        )
+
+    def _sync_freq_range_after_exclude(self):
+        """剔点应用后：把频率筛选收紧到「当前范围内仍保留点」的 min～max（只缩不扩）。"""
+        if self.fitting_data is None or self.point_keep_mask is None:
+            return
+        if not (self.freq_min_selector.isEnabled() and self.freq_max_selector.isEnabled()):
+            return
+        freqs = self.fitting_data.iloc[:, 0].values.astype(float)
+        # 在当前频率窗内仍保留的点，决定新的显示范围
+        usable = self.point_keep_mask & self._freq_range_mask(freqs)
+        if not np.any(usable):
+            usable = self.point_keep_mask
+        if not np.any(usable):
+            return
+        new_min = float(np.min(freqs[usable]))
+        new_max = float(np.max(freqs[usable]))
+        if new_min > new_max:
+            return
+        # 保证 spinbox 可选范围至少覆盖全数据
+        data_min = float(np.min(freqs))
+        data_max = float(np.max(freqs))
+        if data_min == data_max:
+            data_max = data_min + 1e-9
+        for widget in (self.freq_min_selector, self.freq_max_selector):
+            widget.blockSignals(True)
+        self.freq_min_selector.setRange(data_min, data_max)
+        self.freq_max_selector.setRange(data_min, data_max)
+        self.freq_min_selector.setValue(new_min)
+        self.freq_max_selector.setValue(new_max)
+        for widget in (self.freq_min_selector, self.freq_max_selector):
+            widget.blockSignals(False)
+
+    def get_excluded_frequencies(self):
+        """返回当前被剔除的频率列表（仅剔点，不含频率范围外）。"""
+        if self.fitting_data is None or self.point_keep_mask is None:
+            return []
+        freqs = self.fitting_data.iloc[:, 0].values.astype(float)
+        return [float(f) for f, keep in zip(freqs, self.point_keep_mask) if not keep]
+
+    def _refresh_point_table(self):
+        if not hasattr(self, 'point_table'):
+            return
+        self._point_table_block = True
+        try:
+            if self.fitting_data is None:
+                self.point_table.setRowCount(0)
+                self.point_exclude_status.setText("尚未加载数据")
+                self._update_fit_points_label()
+                return
+            freqs, V3 = self._parse_v3_arrays_from_fitting_data()
+            if self.point_keep_mask is None or len(self.point_keep_mask) != len(freqs):
+                self._reset_point_keep_mask()
+            suggest = set(self._auto_suggest_exclude or [])
+            n = len(freqs)
+            self.point_table.setRowCount(n)
+            n_excl = int(np.sum(~self.point_keep_mask))
+            n_fit = int(np.sum(self._combined_keep_mask(freqs)))
+            for i in range(n):
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                chk.setCheckState(Qt.Checked if self.point_keep_mask[i] else Qt.Unchecked)
+                self.point_table.setItem(i, 0, chk)
+                self.point_table.setItem(i, 1, QTableWidgetItem(f"{freqs[i]:.6g}"))
+                self.point_table.setItem(i, 2, QTableWidgetItem(f"{abs(V3[i]):.6e}"))
+                self.point_table.setItem(i, 3, QTableWidgetItem(f"{np.angle(V3[i], deg=True):.2f}"))
+                flag = "建议剔除" if i in suggest else ""
+                flag_item = QTableWidgetItem(flag)
+                if i in suggest:
+                    flag_item.setForeground(QColor(198, 40, 40))
+                self.point_table.setItem(i, 4, flag_item)
+                if not self.point_keep_mask[i]:
+                    for c in range(5):
+                        it = self.point_table.item(i, c)
+                        if it:
+                            it.setBackground(QColor(187, 222, 251))  # 浅蓝，对应可视化蓝点
+            self.point_exclude_status.setText(
+                f"共 {n} 点，已剔除 {n_excl} 点，最终参与拟合 {n_fit} 点"
+                + (f"；自动建议 {len(suggest)} 点" if suggest else "")
+            )
+            self._update_fit_points_label()
+        finally:
+            self._point_table_block = False
+
+    def _on_point_table_item_changed(self, item):
+        if self._point_table_block or item is None or item.column() != 0:
+            return
+        if self.point_keep_mask is None:
+            return
+        row = item.row()
+        if 0 <= row < len(self.point_keep_mask):
+            self.point_keep_mask[row] = item.checkState() == Qt.Checked
+            self._sync_freq_range_after_exclude()
+            self._refresh_point_table()
+            self.preview_points_in_viz()
+
+    @staticmethod
+    def _median_smooth_1d(y, half=2):
+        y = np.asarray(y, dtype=float)
+        out = np.empty_like(y)
+        n = len(y)
+        for i in range(n):
+            lo = max(0, i - half)
+            hi = min(n, i + half + 1)
+            out[i] = np.median(y[lo:hi])
+        return out
+
+    def detect_outliers_auto(self):
+        """基于 log|V3| 对 log f 的 MAD 残差检测异常点（仅建议，不立即剔除）。"""
+        if self.fitting_data is None:
+            QMessageBox.warning(self, "提示", "请先加载数据。")
+            return
+        freqs, V3 = self._parse_v3_arrays_from_fitting_data()
+        # 只在当前频率筛选范围内检测
+        range_mask = self._freq_range_mask(freqs)
+        idx = np.where(range_mask)[0]
+        if len(idx) < 5:
+            QMessageBox.warning(self, "提示", "有效点数太少，无法可靠自动检测。")
+            return
+
+        f = freqs[idx]
+        amp = np.abs(V3[idx])
+        order = np.argsort(f)
+        f_s = f[order]
+        y = np.log10(np.maximum(amp[order], 1e-30))
+        # 优先 savgol，失败则中值平滑
+        yhat = None
+        try:
+            from scipy.signal import savgol_filter
+            win = min(len(y), 7)
+            if win % 2 == 0:
+                win -= 1
+            if win >= 5:
+                yhat = savgol_filter(y, win, 2)
+        except Exception:
+            yhat = None
+        if yhat is None:
+            yhat = self._median_smooth_1d(y, half=2)
+
+        resid = y - yhat
+        med = np.median(resid)
+        mad = np.median(np.abs(resid - med))
+        scale = 1.4826 * mad if mad > 1e-15 else (np.std(resid) if np.std(resid) > 1e-15 else 1e-15)
+        k = float(self.outlier_k_spin.value())
+        bad_local = np.where(np.abs(resid - med) > k * scale)[0]
+        # 限制最多剔 15%
+        max_bad = max(1, int(0.15 * len(idx)))
+        if len(bad_local) > max_bad:
+            scores = np.abs(resid[bad_local] - med)
+            take = np.argsort(scores)[::-1][:max_bad]
+            bad_local = bad_local[take]
+
+        suggest = idx[order[bad_local]].astype(int).tolist()
+        self._auto_suggest_exclude = suggest
+        self.apply_outlier_btn.setEnabled(len(suggest) > 0)
+        self._refresh_point_table()
+        QMessageBox.information(
+            self, "自动检测",
+            f"建议剔除 {len(suggest)} 个点（k={k}）。\n"
+            f"请核对表格中「建议剔除」标记后，点击「应用检测结果」，"
+            f"或手动取消勾选「保留」。"
+        )
+
+    def apply_auto_exclude(self):
+        if not self._auto_suggest_exclude:
+            QMessageBox.warning(self, "提示", "没有可应用的检测结果，请先自动检测。")
+            return
+        if self.point_keep_mask is None:
+            self._reset_point_keep_mask()
+        for i in self._auto_suggest_exclude:
+            if 0 <= i < len(self.point_keep_mask):
+                self.point_keep_mask[i] = False
+        self._sync_freq_range_after_exclude()
+        self._refresh_point_table()
+        self.preview_points_in_viz(switch_tab=True)
+
+    def restore_all_points(self):
+        self._reset_point_keep_mask()
+        # 恢复全数据频率范围
+        if self.fitting_data is not None:
+            freqs = self.fitting_data.iloc[:, 0].values.astype(float)
+            self.initialize_frequency_filters(freqs)
+        self._refresh_point_table()
+        self.preview_points_in_viz(switch_tab=True)
+
+    def preview_points_in_viz(self, switch_tab=False):
+        if self.fitting_data is None:
+            return
+        freqs, V3 = self._parse_v3_arrays_from_fitting_data()
+        keep = self.point_keep_mask
+        if keep is None or len(keep) != len(freqs):
+            keep = np.ones(len(freqs), dtype=bool)
+        range_mask = self._freq_range_mask(freqs)
+        if self._preview_handler is not None:
+            self._preview_handler(freqs, V3, keep, range_mask, switch_tab)
+        else:
+            QMessageBox.information(self, "提示", "未关联结果可视化页。")
 
     def _parse_v3_from_dataframe(self, df):
         """从 DataFrame 中提取 V3 复数数据"""
@@ -3600,9 +5309,9 @@ class FittingWidget(QWidget):
                 if apply_cal:
                     V3_exp = calibrator.correct_v3omega(freqs, V3_exp)
 
-                sp = {}
-                for param, inp in ds_info['sensor_inputs'].items():
-                    sp[param] = float(inp.text())
+                sp = sensor_dict_for_model(
+                    {param: inp.text() for param, inp in ds_info['sensor_inputs'].items()}
+                )
 
                 datasets.append({
                     'freqs': freqs,
@@ -3780,60 +5489,36 @@ class FittingWidget(QWidget):
             self.correlation_table.setColumnCount(0)
             self.correlation_summary.setText("拟合中...")
 
-            # 准备数据
-            freqs = self.fitting_data.iloc[:, 0].values.astype(float)  # 假设第一列是频率
-
-            use_filter = self.freq_min_selector.isEnabled() and self.freq_max_selector.isEnabled()
-            if use_filter:
-                min_freq = self.freq_min_selector.value()
-                max_freq = self.freq_max_selector.value()
-                mask = (freqs >= min_freq) & (freqs <= max_freq)
-            else:
-                mask = np.ones(freqs.shape, dtype=bool)
-
-            if not np.any(mask):
-                QMessageBox.warning(self, "警告", "选定的频率区间内没有数据点！")
+            # 准备数据（频率筛选 ∩ 剔点保留 + 可选信号校正）
+            freqs_all, V3_raw = self._parse_v3_arrays_from_fitting_data()
+            keep_mask = self._combined_keep_mask(freqs_all)
+            n_excl = int(np.sum(~self.point_keep_mask)) if self.point_keep_mask is not None else 0
+            freqs, V3_exp = self._build_experiment_v3()
+            if freqs is None:
                 return
 
-            freqs = freqs[mask]
+            if n_excl > 0:
+                self.results_text.append(f"✓ 已剔除 {n_excl} 个异常点，本次拟合使用 {len(freqs)} 个点\n")
 
-            # 查找V3数据列
-            if 'v3_real' in self.fitting_data.columns and 'v3_imag' in self.fitting_data.columns:
-                real_vals = self.fitting_data['v3_real'].values.astype(float)
-                imag_vals = self.fitting_data['v3_imag'].values.astype(float)
-            elif 'V3_Real' in self.fitting_data.columns:
-                real_vals = self.fitting_data['V3_Real'].values.astype(float)
-                imag_vals = self.fitting_data['V3_Imag'].values.astype(float)
-            else:
-                # 尝试从第2、3列获取
-                real_vals = self.fitting_data.iloc[:, 1].values.astype(float)
-                imag_vals = self.fitting_data.iloc[:, 2].values.astype(float)
-
-            V3_exp = real_vals[mask] + 1j * imag_vals[mask]
-
-            # 应用信号校正（如果已标定且用户勾选）
             calibrator = self._get_calibrator()
             if self.apply_calibration_cb.isChecked() and calibrator is not None and calibrator.is_calibrated:
-                V3_exp_uncorrected = V3_exp.copy()
-                V3_exp = calibrator.correct_v3omega(freqs, V3_exp)
+                # 校正已在 _build_experiment_v3 中应用；此处仅记录日志
+                V3_unc = V3_raw[keep_mask]
                 self.results_text.append("✓ 已应用信号通路校正（基线扣除 + 相位校正）\n")
                 if len(V3_exp) > 0:
-                    self.results_text.append(f"  [Debug] 数据点1 校正前: {V3_exp_uncorrected[0]:.4e}")
+                    self.results_text.append(f"  [Debug] 数据点1 校正前: {V3_unc[0]:.4e}")
                     self.results_text.append(f"  [Debug] 数据点1 校正后: {V3_exp[0]:.4e}")
                     self.results_text.append(
-                        f"  [Debug] 相位变化: {np.angle(V3_exp_uncorrected[0], deg=True):.1f}° -> {np.angle(V3_exp[0], deg=True):.1f}°\n")
+                        f"  [Debug] 相位变化: {np.angle(V3_unc[0], deg=True):.1f}° -> {np.angle(V3_exp[0], deg=True):.1f}°\n")
             elif calibrator is not None and calibrator.is_calibrated:
                 self.results_text.append("⚠ 已加载信号校正参数，但未勾选应用校正，本次拟合使用原始数据\n")
 
-            # 获取传感器参数
-            sensor_params = {}
-            for param, input_widget in self.sensor_inputs.items():
-                try:
-                    value = float(input_widget.text())
-                    sensor_params[param] = value
-                except:
-                    QMessageBox.warning(self, "警告", f"传感器参数 {param} 输入无效")
-                    return
+            # 获取传感器参数（界面 α_R → 模型 dR_dT）
+            try:
+                sensor_params = self._collect_sensor_params_from_gui()
+            except ValueError as e:
+                QMessageBox.warning(self, "警告", str(e))
+                return
 
             # 获取材料层参数
             layers = []
@@ -3853,67 +5538,9 @@ class FittingWidget(QWidget):
             mode = self.fit_mode.currentText()
             is_sensor_only = mode == "传感器参数拟合"
             is_combined = mode == "材料+传感器联合拟合"
-            params_to_fit = {}
-            param_bounds = {}
-
-            if not is_sensor_only:
-                for i in range(len(self.layer_widgets)):
-                    layer_params_to_fit = []
-                    layer_bounds = {}
-
-                    for param in ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']:
-                        checkbox = self.findChild(QCheckBox, f"layer_{i}_{param}_fit")
-                        if checkbox and checkbox.isChecked():
-                            layer_params_to_fit.append(param)
-
-                            min_input = self.findChild(QLineEdit, f"layer_{i}_{param}_min")
-                            max_input = self.findChild(QLineEdit, f"layer_{i}_{param}_max")
-
-                            if min_input and max_input and min_input.text() and max_input.text():
-                                layer_bounds[param] = (float(min_input.text()), float(max_input.text()))
-                            else:
-                                if param == 'k_y':
-                                    layer_bounds[param] = (0.01, 5000)
-                                elif param == 'rho':
-                                    layer_bounds[param] = (100, 20000)
-                                elif param == 'cap':
-                                    layer_bounds[param] = (100, 5000)
-                                elif param == 'Rc':
-                                    layer_bounds[param] = (0, 1e-3)
-                                else:
-                                    current_val = layers[i][param]
-                                    layer_bounds[param] = (current_val * 0.1, current_val * 10)
-
-                    if layer_params_to_fit:
-                        params_to_fit[f'layer_{i}'] = layer_params_to_fit
-                        param_bounds[f'layer_{i}'] = layer_bounds
-
-            if is_sensor_only or is_combined:
-                sensor_params_to_fit = []
-                sensor_bounds = {}
-
-                for param in self.sensor_inputs.keys():
-                    checkbox = self.sensor_widget.findChild(QCheckBox, f"sensor_{param}_fit")
-                    if checkbox and checkbox.isChecked():
-                        sensor_params_to_fit.append(param)
-                        min_input = self.sensor_widget.findChild(QLineEdit, f"sensor_{param}_min")
-                        max_input = self.sensor_widget.findChild(QLineEdit, f"sensor_{param}_max")
-                        if (min_input and max_input and min_input.text().strip()
-                                and max_input.text().strip()):
-                            sensor_bounds[param] = (
-                                float(min_input.text()),
-                                float(max_input.text()),
-                            )
-                        else:
-                            current_val = sensor_params[param]
-                            if param == 'dR_dT':
-                                sensor_bounds[param] = (current_val * 0.1, current_val * 10)
-                            else:
-                                sensor_bounds[param] = (current_val * 0.5, current_val * 2.0)
-
-                if sensor_params_to_fit:
-                    params_to_fit['sensor'] = sensor_params_to_fit
-                    param_bounds['sensor'] = sensor_bounds
+            params_to_fit, param_bounds = self._collect_params_to_fit_from_gui(
+                layers, mode
+            )
 
             if is_combined:
                 has_mat = any(k.startswith('layer_') for k in params_to_fit)
@@ -4013,6 +5640,24 @@ class FittingWidget(QWidget):
             try:
                 # 执行拟合
                 self.results_text.append("开始拟合...\n")
+                # 明确打印 GUI 层号 ↔ 模型层号，避免与内部 layer_0（基底）混淆
+                fit_labels = []
+                for key, props in params_to_fit.items():
+                    if key.startswith('layer_'):
+                        gui_idx = int(key.split('_')[1])
+                        model_idx = N - 1 - gui_idx
+                        for prop in props:
+                            fit_labels.append(
+                                f"第{gui_idx + 1}层.{prop}（模型 layer_{model_idx}）"
+                            )
+                    elif key == 'sensor':
+                        for prop in props:
+                            name = 'α_R' if prop == 'dR_dT' else prop
+                            fit_labels.append(f"传感器.{name}")
+                if fit_labels:
+                    self.results_text.append(
+                        "拟合参数: " + "、".join(fit_labels) + "\n"
+                    )
                 QApplication.processEvents()
 
                 fitted_result_raw = fitter.fit(
@@ -4094,34 +5739,21 @@ class FittingWidget(QWidget):
                     self.figure.canvas.draw()
 
     def _build_experiment_v3(self, silent=False):
-        """根据已加载数据、频率筛选与信号校正返回 (freqs, V3_exp)。失败返回 (None, None)。"""
-        freqs = self.fitting_data.iloc[:, 0].values.astype(float)
+        """根据已加载数据、频率筛选、剔点与信号校正返回 (freqs, V3_exp)。失败返回 (None, None)。"""
+        if self.fitting_data is None:
+            if not silent:
+                QMessageBox.warning(self, "警告", "请先加载数据！")
+            return None, None
 
-        use_filter = self.freq_min_selector.isEnabled() and self.freq_max_selector.isEnabled()
-        if use_filter:
-            min_freq = self.freq_min_selector.value()
-            max_freq = self.freq_max_selector.value()
-            mask = (freqs >= min_freq) & (freqs <= max_freq)
-        else:
-            mask = np.ones(freqs.shape, dtype=bool)
+        freqs_all, V3_all = self._parse_v3_arrays_from_fitting_data()
+        mask = self._combined_keep_mask(freqs_all)
 
         if not np.any(mask):
             if not silent:
-                QMessageBox.warning(self, "警告", "选定的频率区间内没有数据点！")
+                QMessageBox.warning(self, "警告", "选定的频率区间/剔点后没有数据点！")
             return None, None
-        freqs = freqs[mask]
-
-        if 'v3_real' in self.fitting_data.columns and 'v3_imag' in self.fitting_data.columns:
-            real_vals = self.fitting_data['v3_real'].values.astype(float)
-            imag_vals = self.fitting_data['v3_imag'].values.astype(float)
-        elif 'V3_Real' in self.fitting_data.columns:
-            real_vals = self.fitting_data['V3_Real'].values.astype(float)
-            imag_vals = self.fitting_data['V3_Imag'].values.astype(float)
-        else:
-            real_vals = self.fitting_data.iloc[:, 1].values.astype(float)
-            imag_vals = self.fitting_data.iloc[:, 2].values.astype(float)
-
-        V3_exp = real_vals[mask] + 1j * imag_vals[mask]
+        freqs = freqs_all[mask]
+        V3_exp = V3_all[mask]
 
         calibrator = self._get_calibrator()
         if self.apply_calibration_cb.isChecked() and calibrator is not None and calibrator.is_calibrated:
@@ -4197,15 +5829,16 @@ class FittingWidget(QWidget):
             freqs, V3_exp = self._build_experiment_v3()
             if freqs is None:
                 return
+            n_excl = len(self.get_excluded_frequencies())
+            if n_excl > 0:
+                self.results_text.append(f"✓ 已剔除 {n_excl} 个异常点，本次拟合使用 {len(freqs)} 个点\n")
 
-            # 传感器参数
-            sensor_params = {}
-            for param, input_widget in self.sensor_inputs.items():
-                try:
-                    sensor_params[param] = float(input_widget.text())
-                except Exception:
-                    QMessageBox.warning(self, "警告", f"传感器参数 {param} 输入无效")
-                    return
+            # 传感器参数（界面 α_R → 模型 dR_dT）
+            try:
+                sensor_params = self._collect_sensor_params_from_gui()
+            except ValueError as e:
+                QMessageBox.warning(self, "警告", str(e))
+                return
 
             # 材料层参数（GUI 顺序：顶层→基底）
             layers = []
@@ -4222,60 +5855,9 @@ class FittingWidget(QWidget):
             is_combined = mode == "材料+传感器联合拟合"
 
             # 收集其余待拟合参数（排除被约束两层的厚度 H，厚度由 thickness_link 处理）
-            params_to_fit = {}
-            param_bounds = {}
-            for i in range(N):
-                layer_params_to_fit = []
-                layer_bounds = {}
-                for param in ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']:
-                    if param == 'H' and i in (gui_upper, gui_lower):
-                        continue  # 厚度由总厚度约束自由度处理，忽略勾选
-                    checkbox = self.findChild(QCheckBox, f"layer_{i}_{param}_fit")
-                    if checkbox and checkbox.isChecked():
-                        layer_params_to_fit.append(param)
-                        min_input = self.findChild(QLineEdit, f"layer_{i}_{param}_min")
-                        max_input = self.findChild(QLineEdit, f"layer_{i}_{param}_max")
-                        if min_input and max_input and min_input.text() and max_input.text():
-                            layer_bounds[param] = (float(min_input.text()), float(max_input.text()))
-                        else:
-                            if param == 'k_y':
-                                layer_bounds[param] = (0.01, 5000)
-                            elif param == 'rho':
-                                layer_bounds[param] = (100, 20000)
-                            elif param == 'cap':
-                                layer_bounds[param] = (100, 5000)
-                            elif param == 'Rc':
-                                layer_bounds[param] = (0, 1e-3)
-                            elif param == 'psi':
-                                layer_bounds[param] = (0.01, 100)
-                            else:
-                                cv = layers[i][param]
-                                layer_bounds[param] = (cv * 0.1, cv * 10)
-                if layer_params_to_fit:
-                    params_to_fit[f'layer_{i}'] = layer_params_to_fit
-                    param_bounds[f'layer_{i}'] = layer_bounds
-
-            if is_combined:
-                sensor_params_to_fit = []
-                sensor_bounds = {}
-                for param in self.sensor_inputs.keys():
-                    checkbox = self.sensor_widget.findChild(QCheckBox, f"sensor_{param}_fit")
-                    if checkbox and checkbox.isChecked():
-                        sensor_params_to_fit.append(param)
-                        min_input = self.sensor_widget.findChild(QLineEdit, f"sensor_{param}_min")
-                        max_input = self.sensor_widget.findChild(QLineEdit, f"sensor_{param}_max")
-                        if (min_input and max_input and min_input.text().strip()
-                                and max_input.text().strip()):
-                            sensor_bounds[param] = (float(min_input.text()), float(max_input.text()))
-                        else:
-                            cv = sensor_params[param]
-                            if param == 'dR_dT':
-                                sensor_bounds[param] = (cv * 0.1, cv * 10)
-                            else:
-                                sensor_bounds[param] = (cv * 0.5, cv * 2.0)
-                if sensor_params_to_fit:
-                    params_to_fit['sensor'] = sensor_params_to_fit
-                    param_bounds['sensor'] = sensor_bounds
+            params_to_fit, param_bounds = self._collect_params_to_fit_from_gui(
+                layers, mode, skip_h_layers={gui_upper, gui_lower}
+            )
 
             fit_method_map = {
                 "Amplitude": "amp", "Phase": "phase",
@@ -4399,7 +5981,7 @@ class FittingWidget(QWidget):
                     self.results_text.append(f"  {param}: {value:.6e}")
                 self.results_text.append("\n拟合的材料参数:")
                 for i, layer in enumerate(fitted_result['layers']):
-                    self.results_text.append(f"\n第 {i + 1} 层 (GUI Layer {i}):")
+                    self.results_text.append(f"\n第 {i + 1} 层:")
                     for param, value in layer.items():
                         self.results_text.append(f"  {param}: {value:.6e}")
             else:
@@ -4407,7 +5989,7 @@ class FittingWidget(QWidget):
                 result_kind = 'material'
                 self.results_text.append("\n拟合的材料参数:")
                 for i, layer in enumerate(fitted_result):
-                    self.results_text.append(f"\n第 {i + 1} 层 (GUI Layer {i}):")
+                    self.results_text.append(f"\n第 {i + 1} 层:")
                     for param, value in layer.items():
                         self.results_text.append(f"  {param}: {value:.6e}")
 
@@ -4456,14 +6038,22 @@ class FittingWidget(QWidget):
         return pd.DataFrame({cols[i]: values[i] for i in range(min(len(cols), 5))})
 
     @staticmethod
-    def _write_export_dataframe(df, filename):
-        if filename.endswith('.xlsx'):
-            df.to_excel(filename, index=False)
-        else:
-            if not filename.endswith('.csv'):
-                filename = filename + '.csv'
-            df.to_csv(filename, index=False)
-        return filename
+    def _write_export_dataframe(df, filename, model_config=None):
+        path = str(filename)
+        if path.lower().endswith(('.xlsx', '.xlsm')):
+            save_dataframe_with_model_config(path, df, model_config)
+            return path
+        if not path.lower().endswith('.csv'):
+            path = path + '.csv'
+        df.to_csv(path, index=False)
+        if model_config:
+            meta_path = os.path.splitext(path)[0] + '_model.json'
+            try:
+                with open(meta_path, 'w', encoding='utf-8') as f:
+                    json.dump(model_config, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        return path
 
     @staticmethod
     def _append_path_suffix(path, suffix):
@@ -4505,19 +6095,23 @@ class FittingWidget(QWidget):
         freqs = source_df.iloc[:, 0].values.astype(float)
         V3_fit = self._compute_v3_from_fitter(freqs, fitter)
         export_df = self._build_fitted_export_dataframe(freqs, V3_fit, source_df)
+        model_config = self.get_model_config()
 
-        default_name = f"fitted_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        default_name = f"fitted_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         filename, _ = QFileDialog.getSaveFileName(
             self, "导出拟合数据", default_name,
-            "CSV Files (*.csv);;Excel Files (*.xlsx)"
+            "Excel Files (*.xlsx);;CSV Files (*.csv)"
         )
         if not filename:
             return
 
-        saved_path = self._write_export_dataframe(export_df, filename)
+        saved_path = self._write_export_dataframe(export_df, filename, model_config)
+        extra = ""
+        if str(saved_path).lower().endswith(('.xlsx', '.xlsm')):
+            extra = "\n已同时保存频率范围、传感器参数与材料层参数。"
         QMessageBox.information(
             self, "成功",
-            f"拟合数据已导出到:\n{saved_path}\n共 {len(export_df)} 个数据点"
+            f"拟合数据已导出到:\n{saved_path}\n共 {len(export_df)} 个数据点{extra}"
         )
 
     def _export_joint_fitted_data(self, fitter):
@@ -4525,14 +6119,15 @@ class FittingWidget(QWidget):
             QMessageBox.warning(self, "警告", "未找到联合拟合数据集！")
             return
 
-        default_name = f"fitted_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        default_name = f"fitted_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         filename, _ = QFileDialog.getSaveFileName(
             self, "导出拟合数据", default_name,
-            "CSV Files (*.csv);;Excel Files (*.xlsx)"
+            "Excel Files (*.xlsx);;CSV Files (*.csv)"
         )
         if not filename:
             return
 
+        model_config = self.get_model_config()
         saved_paths = []
         for i, ds_info in enumerate(self.joint_datasets_ui):
             source_df = ds_info['data']
@@ -4545,13 +6140,18 @@ class FittingWidget(QWidget):
                 freqs, fitter, b=ds['b'], sensor_params=ds['sensor_params']
             )
             export_df = self._build_fitted_export_dataframe(freqs, V3_fit, source_df)
+            cfg = dict(model_config)
+            sens = {}
+            for p, inp in ds_info['sensor_inputs'].items():
+                sens[p] = inp.text().strip()
+            cfg['sensor'] = sens
 
             if len(self.joint_datasets_ui) == 1:
                 out_path = filename
             else:
                 out_path = self._append_path_suffix(filename, f"_ds{i + 1}")
 
-            saved_paths.append(self._write_export_dataframe(export_df, out_path))
+            saved_paths.append(self._write_export_dataframe(export_df, out_path, cfg))
 
         if not saved_paths:
             QMessageBox.warning(self, "警告", "没有可导出的数据集！")
@@ -4561,10 +6161,11 @@ class FittingWidget(QWidget):
             msg = f"拟合数据已导出到:\n{saved_paths[0]}"
         else:
             msg = "拟合数据已导出到:\n" + "\n".join(saved_paths)
+        msg += "\n已同时保存频率范围、传感器参数与材料层参数。"
         QMessageBox.information(self, "成功", msg)
 
     def export_results(self):
-        """导出拟合结果"""
+        """导出拟合结果（含频率范围、传感器参数、材料参数）"""
         if not hasattr(self, 'fitted_result'):
             QMessageBox.warning(self, "警告", "没有拟合结果可导出！")
             return
@@ -4576,11 +6177,27 @@ class FittingWidget(QWidget):
 
         if filename:
             try:
-                # 准备导出数据
+                model_cfg = self.get_model_config()
+
+                def _jsonify_val(v):
+                    if isinstance(v, (float, int, np.floating)) and np.isinf(v):
+                        return 'inf'
+                    if isinstance(v, (np.floating, float)):
+                        return float(v)
+                    if isinstance(v, (np.integer, int)):
+                        return int(v)
+                    return v
+
                 export_data = {
                     'timestamp': datetime.now().isoformat(),
+                    'export_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'fit_mode': self.fit_mode.currentText(),
                     'fit_method': self.fit_method.currentText(),
+                    'frequency_range': model_cfg.get('frequency_range'),
+                    'sensor': model_cfg.get('sensor'),
+                    'layers': model_cfg.get('layers'),
+                    'excluded_frequencies_hz': self.get_excluded_frequencies(),
+                    'n_excluded_points': len(self.get_excluded_frequencies()),
                     'results': {}
                 }
 
@@ -4588,37 +6205,31 @@ class FittingWidget(QWidget):
                 if fit_mode == "传感器参数拟合":
                     export_data['results'] = {}
                     for k, v in self.fitted_result.items():
-                        if isinstance(v, (float, int, np.floating)) and np.isinf(v):
-                            export_data['results'][k] = 'inf'
-                        else:
-                            export_data['results'][k] = float(v)
+                        export_data['results'][k] = _jsonify_val(v)
                 elif fit_mode == "材料+传感器联合拟合":
                     export_data['results'] = {'layers': {}, 'sensor_params': {}}
                     for i, layer in enumerate(self.fitted_result['layers']):
                         export_data['results']['layers'][f'layer_{i}'] = {}
                         for key, value in layer.items():
-                            if np.isinf(value):
-                                export_data['results']['layers'][f'layer_{i}'][key] = 'inf'
-                            else:
-                                export_data['results']['layers'][f'layer_{i}'][key] = float(value)
+                            export_data['results']['layers'][f'layer_{i}'][key] = _jsonify_val(value)
                     for key, value in self.fitted_result['sensor_params'].items():
-                        if isinstance(value, (float, int, np.floating)) and np.isinf(value):
-                            export_data['results']['sensor_params'][key] = 'inf'
-                        else:
-                            export_data['results']['sensor_params'][key] = float(value)
+                        export_data['results']['sensor_params'][key] = _jsonify_val(value)
                 else:
                     for i, layer in enumerate(self.fitted_result):
                         export_data['results'][f'layer_{i}'] = {}
                         for key, value in layer.items():
-                            if np.isinf(value):
-                                export_data['results'][f'layer_{i}'][key] = 'inf'
-                            else:
-                                export_data['results'][f'layer_{i}'][key] = float(value)
+                            export_data['results'][f'layer_{i}'][key] = _jsonify_val(value)
 
                 with open(filename, 'w', encoding='utf-8') as f:
                     json.dump(export_data, f, indent=4, ensure_ascii=False)
 
-                QMessageBox.information(self, "成功", f"结果已导出到:\n{filename}")
+                QMessageBox.information(
+                    self, "成功",
+                    f"结果已导出到:\n{filename}\n"
+                    f"时间: {export_data['export_time']}\n"
+                    f"剔除频率点: {export_data['n_excluded_points']} 个\n"
+                    f"（含频率范围、传感器/材料参数、剔除点列表与拟合结果）"
+                )
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出失败:\n{str(e)}")
 
@@ -4661,10 +6272,13 @@ class PenetrationAnalysisWidget(QWidget):
         # ---- 左侧参数 ----
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(340)
-        left_scroll.setMaximumWidth(420)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setMinimumWidth(460)
+        left_scroll.setMaximumWidth(520)
         left_w = QWidget()
         left = QVBoxLayout(left_w)
+        left.setContentsMargins(8, 8, 8, 8)
+        left.setSpacing(8)
 
         sync_row = QHBoxLayout()
         self.sync_btn = QPushButton("从数据拟合同步参数")
@@ -4676,15 +6290,18 @@ class PenetrationAnalysisWidget(QWidget):
         # 传感器
         sensor_group = QGroupBox("传感器参数")
         sensor_layout = QGridLayout()
+        sensor_layout.setColumnStretch(1, 1)
         self.sensor_combo = QComboBox()
         self.sensor_combo.addItems(self.sensor_db.get_sensor_names())
         self.sensor_combo.currentTextChanged.connect(self._load_sensor_preset)
         sensor_layout.addWidget(QLabel("预设:"), 0, 0)
         sensor_layout.addWidget(self.sensor_combo, 0, 1)
         self.sensor_inputs = {}
-        for i, p in enumerate(['b', 'L', 'R', 'dR_dT', 'V_rms', 'H_e', 'rho_C_e']):
-            sensor_layout.addWidget(QLabel(p), i + 1, 0)
+        for i, p in enumerate(SENSOR_UI_PARAMS):
+            label = SENSOR_UI_LABELS[i] if i < len(SENSOR_UI_LABELS) else p
+            sensor_layout.addWidget(QLabel(label), i + 1, 0)
             inp = QLineEdit()
+            inp.setMinimumWidth(0)
             self.sensor_inputs[p] = inp
             sensor_layout.addWidget(inp, i + 1, 1)
         sensor_group.setLayout(sensor_layout)
@@ -4692,7 +6309,7 @@ class PenetrationAnalysisWidget(QWidget):
         self._load_sensor_preset(self.sensor_combo.currentText())
 
         # 材料层
-        layer_group = QGroupBox("材料层（顶层→基底，最后一层为基底）")
+        layer_group = QGroupBox("材料层（顶层→基底）")
         layer_v = QVBoxLayout()
         self.layer_layout = QVBoxLayout()
         layer_v.addLayout(self.layer_layout)
@@ -4712,24 +6329,29 @@ class PenetrationAnalysisWidget(QWidget):
         # 判据与当前频率
         crit_group = QGroupBox("判据与待评估频率")
         crit = QFormLayout()
+        crit.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         self.line_factor = QDoubleSpinBox()
         self.line_factor.setRange(1.0, 50.0)
         self.line_factor.setValue(5.0)
         self.line_factor.setDecimals(1)
+        self.line_factor.setMinimumWidth(0)
         self.line_factor.setToolTip("线热源近似：要求 δ ≥ N·b（Cahill 常用 N=5，斜率误差约 1%）")
-        crit.addRow("线热源因子 N (δ≥N·b):", self.line_factor)
+        crit.addRow("线热源因子 N:", self.line_factor)
 
         self.sub_factor = QDoubleSpinBox()
         self.sub_factor.setRange(1.0, 50.0)
         self.sub_factor.setValue(5.0)
         self.sub_factor.setDecimals(1)
-        self.sub_factor.setToolTip("半无限基底近似：要求 δ ≤ H_sub/N（常用 N=5）")
-        crit.addRow("基底因子 M (δ≤H/M):", self.sub_factor)
+        self.sub_factor.setMinimumWidth(0)
+        self.sub_factor.setToolTip("半无限基底近似：要求 δ ≤ H_sub/M（常用 M=5）")
+        crit.addRow("基底因子 M:", self.sub_factor)
 
         self.eval_fmin = QLineEdit("1")
+        self.eval_fmin.setMinimumWidth(0)
         self.eval_fmax = QLineEdit("1000")
-        crit.addRow("当前扫频下限 f_min (Hz):", self.eval_fmin)
-        crit.addRow("当前扫频上限 f_max (Hz):", self.eval_fmax)
+        self.eval_fmax.setMinimumWidth(0)
+        crit.addRow("f_min (Hz):", self.eval_fmin)
+        crit.addRow("f_max (Hz):", self.eval_fmax)
         crit_group.setLayout(crit)
         left.addWidget(crit_group)
 
@@ -4775,6 +6397,7 @@ class PenetrationAnalysisWidget(QWidget):
     def _add_layer_ui(self, idx):
         box = QGroupBox(f"第 {idx} 层" + (" (基底)" if False else ""))
         lay = QGridLayout()
+        lay.setColumnStretch(1, 1)
         combo = QComboBox()
         combo.addItems(self.material_db.get_material_names())
         lay.addWidget(QLabel("材料:"), 0, 0)
@@ -4783,6 +6406,7 @@ class PenetrationAnalysisWidget(QWidget):
         for i, p in enumerate(['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']):
             lay.addWidget(QLabel(p), i + 1, 0)
             inp = QLineEdit()
+            inp.setMinimumWidth(0)
             inputs[p] = inp
             lay.addWidget(inp, i + 1, 1)
         box.setLayout(lay)
@@ -4820,7 +6444,7 @@ class PenetrationAnalysisWidget(QWidget):
             return
         try:
             config = self._fitting_source.get_model_config()
-            sensor = config.get('sensor', {})
+            sensor = sensor_dict_for_ui(config.get('sensor', {}) or {})
             for k, v in sensor.items():
                 if k in self.sensor_inputs:
                     self.sensor_inputs[k].setText(str(v))
@@ -5121,6 +6745,7 @@ class VisualizationWidget(QWidget):
         super().__init__()
         self.current_data = None
         self.joint_data = None
+        self.preview_data = None  # 加载/剔点预览（无拟合曲线）
         self.curve_checkboxes = []
         self.pm20_checkboxes = []
         self.init_ui()
@@ -5216,16 +6841,28 @@ class VisualizationWidget(QWidget):
         self.pm20_checkboxes = []
 
     @staticmethod
-    def _param_map_label(p_map):
-        """生成拟合参数显示名（模型层序：L0=基底）。"""
+    def _param_map_label(p_map, n_layers=None):
+        """生成拟合参数显示名（与 GUI 一致：第1层=顶层，最后一层=基底）。"""
         ptype = p_map.get('type', 'material')
         if ptype == 'sensor':
-            return f"sensor.{p_map['prop']}"
+            prop = p_map['prop']
+            if prop == 'dR_dT':
+                return "传感器.α_R"
+            return f"传感器.{prop}"
         if ptype == 'thickness_link':
-            return f"H_link(L{p_map['upper_idx']}/L{p_map['lower_idx']})"
+            u, l = p_map['upper_idx'], p_map['lower_idx']
+            if n_layers:
+                gu, gl = n_layers - 1 - u, n_layers - 1 - l
+                return f"H约束(第{gu + 1}+第{gl + 1}层)"
+            return f"H_link(L{u}/L{l})"
         # JointThermalModelFitter 的 map 无 type 字段
         if 'layer_idx' in p_map:
-            return f"L{p_map['layer_idx']}.{p_map['prop']}"
+            i = p_map['layer_idx']
+            prop = p_map['prop']
+            if n_layers:
+                # 模型 layer_0=基底 → GUI 第 N 层；layer_{N-1}=顶层 → GUI 第 1 层
+                return f"第{n_layers - i}层.{prop}"
+            return f"L{i}.{prop}"
         return str(p_map.get('prop', '?'))
 
     @staticmethod
@@ -5269,8 +6906,9 @@ class VisualizationWidget(QWidget):
         b = model_ctx['b']
         layers = model_ctx['layers']
         sensor = model_ctx['sensor_params']
+        n_layers = len(layers) if layers else 0
         for i, p_map in enumerate(param_maps):
-            label = self._param_map_label(p_map)
+            label = self._param_map_label(p_map, n_layers=n_layers)
             V_plus = self._v3_with_param_scale(freqs, b, layers, sensor, p_map, 1.2)
             V_minus = self._v3_with_param_scale(freqs, b, layers, sensor, p_map, 0.8)
             if V_plus is None and V_minus is None:
@@ -5289,11 +6927,12 @@ class VisualizationWidget(QWidget):
         series = []
         if not param_maps:
             return series
+        n_layers = len(layers) if layers else 0
         for i, p_map in enumerate(param_maps):
             # 联合拟合 param_map 无 type，按材料处理
             p = dict(p_map)
             p.setdefault('type', 'material')
-            label = self._param_map_label(p)
+            label = self._param_map_label(p, n_layers=n_layers)
             per_ds = []
             any_ok = False
             for ds in datasets:
@@ -5342,6 +6981,7 @@ class VisualizationWidget(QWidget):
                                    param_maps=None):
         """绘制联合拟合结果，每个数据集的实验值和拟合值各自可开关"""
         self.current_data = None
+        self.preview_data = None
         self._clear_checkboxes()
 
         computed = []
@@ -5557,6 +7197,7 @@ class VisualizationWidget(QWidget):
                              title="Fitting Results", model_ctx=None):
         """绘制单数据集拟合结果；若提供 model_ctx 则对每个已拟合参数 ±20% 正演。"""
         self.joint_data = None
+        self.preview_data = None
         self._clear_checkboxes()
 
         pm20_series = self._build_pm20_series_single(freqs, model_ctx)
@@ -5576,6 +7217,119 @@ class VisualizationWidget(QWidget):
             self.curve_panel.setVisible(False)
 
         self._redraw_single()
+
+    def plot_experimental_with_exclusions(self, freqs, V3, keep_mask, range_mask=None,
+                                          title="Loaded Experimental Data"):
+        """加载/剔点预览：保留点红色，剔除点灰色叉，频率范围外浅灰空心。"""
+        self.joint_data = None
+        self.current_data = None
+        self._clear_checkboxes()
+        self.curve_panel.setVisible(False)
+
+        freqs = np.asarray(freqs, dtype=float)
+        V3 = np.asarray(V3)
+        keep = np.asarray(keep_mask, dtype=bool)
+        if range_mask is None:
+            range_mask = np.ones(len(freqs), dtype=bool)
+        else:
+            range_mask = np.asarray(range_mask, dtype=bool)
+
+        self.preview_data = {
+            'freqs': freqs,
+            'V3': V3,
+            'keep': keep,
+            'range_mask': range_mask,
+            'title': title,
+        }
+        self._redraw_preview()
+
+    def _redraw_preview(self):
+        if not self.preview_data:
+            return
+        freqs = self.preview_data['freqs']
+        V3 = self.preview_data['V3']
+        keep = self.preview_data['keep']
+        range_mask = self.preview_data['range_mask']
+        title = self.preview_data['title']
+
+        kept = keep & range_mask
+        excluded = (~keep) & range_mask
+        out_range = ~range_mask
+
+        n_kept = int(np.sum(kept))
+        n_excl = int(np.sum(excluded))
+        n_out = int(np.sum(out_range))
+
+        self.figure.clear()
+        plot_type = self.plot_type.currentText()
+
+        def y_of(v, kind):
+            if kind == 'amp':
+                return np.abs(v) * 1e3
+            if kind == 'pha':
+                return np.angle(v, deg=True)
+            if kind == 're':
+                return v.real * 1e3
+            return v.imag * 1e3
+
+        def ylabel(kind):
+            return {
+                'amp': '|V3| (mV)',
+                'pha': 'Phase (deg)',
+                're': 'Real(V3) (mV)',
+                'im': 'Imag(V3) (mV)',
+            }[kind]
+
+        def draw_ax(ax, kind):
+            plot_fn = ax.loglog if kind == 'amp' else ax.semilogx
+            if np.any(kept):
+                plot_fn(freqs[kept], y_of(V3[kept], kind), 'ro',
+                        label=f'保留 ({n_kept})', markersize=6)
+            if np.any(excluded):
+                # 剔除点用实心蓝，避免灰色/透明看不清
+                plot_fn(freqs[excluded], y_of(V3[excluded], kind), 'o',
+                        color='#1565C0', mfc='#2196F5', mec='#0D47A1',
+                        label=f'已剔除 ({n_excl})', markersize=8, markeredgewidth=1.2)
+            if np.any(out_range):
+                plot_fn(freqs[out_range], y_of(V3[out_range], kind), 'o',
+                        color='#757575', mfc='none', mec='#616161',
+                        label=f'频率范围外 ({n_out})', markersize=6, markeredgewidth=1.2)
+            ax.set_ylabel(ylabel(kind))
+            ax.set_xlabel('Frequency (Hz)')
+            ax.legend(fontsize='small')
+            ax.grid(True, which="both", ls="--", alpha=0.3)
+
+        if plot_type == "All (2x2)":
+            axes = [self.figure.add_subplot(221), self.figure.add_subplot(222),
+                    self.figure.add_subplot(223), self.figure.add_subplot(224)]
+            for ax, kind, t in zip(axes, ['amp', 'pha', 're', 'im'],
+                                   ['V3 Amplitude', 'V3 Phase', 'V3 Real Part', 'V3 Imaginary Part']):
+                draw_ax(ax, kind)
+                ax.set_title(t)
+        elif plot_type == "Amplitude & Phase":
+            ax1 = self.figure.add_subplot(211)
+            ax2 = self.figure.add_subplot(212, sharex=ax1)
+            draw_ax(ax1, 'amp')
+            ax1.set_title('V3 Amplitude')
+            draw_ax(ax2, 'pha')
+            ax2.set_title('V3 Phase')
+        else:
+            ax = self.figure.add_subplot(111)
+            kind_map = {
+                "Amplitude": 'amp', "Phase": 'pha',
+                "Real Part": 're', "Imaginary Part": 'im',
+            }
+            kind = kind_map.get(plot_type, 'amp')
+            draw_ax(ax, kind)
+            ax.set_title(f'V3 {plot_type}', fontsize=14)
+
+        self.figure.suptitle(
+            f"{title}  (保留 {n_kept} / 剔除 {n_excl}"
+            + (f" / 范围外 {n_out}" if n_out else "") + ")",
+            fontsize=14,
+        )
+        self.figure.tight_layout()
+        self.canvas.draw()
 
     def _redraw_single(self):
         """按当前选项重绘单数据集拟合图。"""
@@ -5703,18 +7457,20 @@ class VisualizationWidget(QWidget):
         self.refresh_current_plot()
 
     def refresh_current_plot(self):
-        """按当前选项重绘已有拟合结果（不重新正演）。"""
+        """按当前选项重绘已有拟合结果或预览数据（不重新正演）。"""
         if self.joint_data:
             self._redraw_joint()
         elif self.current_data:
             self._redraw_single()
+        elif self.preview_data:
+            self._redraw_preview()
 
     def refresh_plot(self):
         """刷新图表"""
-        if self.joint_data or self.current_data:
+        if self.joint_data or self.current_data or self.preview_data:
             self.refresh_current_plot()
         else:
-            QMessageBox.information(self, "提示", "请在拟合完成后查看结果")
+            QMessageBox.information(self, "提示", "请先加载数据或完成拟合后再查看")
 
     def save_figure(self):
         """保存图表"""
@@ -5812,6 +7568,34 @@ class ThermalMeasurementGUI(QMainWindow):
         self.sensitivity_widget.set_fitting_source(self.fitting_widget)
         self.penetration_widget.set_fitting_source(self.fitting_widget)
         self.penetration_widget._apply_freq_callback = self._apply_recommended_freqs
+        self.fitting_widget.set_lockin_source(self.lockin_widget)
+        self.lockin_widget.set_fitting_source(self.fitting_widget)
+
+        def _on_data_preview(freqs, V3, keep_mask, range_mask=None, switch_tab=False):
+            freqs = np.asarray(freqs, dtype=float)
+            keep = np.asarray(keep_mask, dtype=bool)
+            if range_mask is None:
+                range_mask = np.ones(len(freqs), dtype=bool)
+            else:
+                range_mask = np.asarray(range_mask, dtype=bool)
+            n_excl = int(np.sum(~keep))
+            n_fit = int(np.sum(keep & range_mask))
+            n_out = int(np.sum(~range_mask))
+            title = "Loaded Experimental Data"
+            if n_excl > 0 or n_out > 0:
+                title = f"Loaded Experimental Data (保留 {n_fit} / 剔除 {n_excl} / 范围外 {n_out})"
+            self.viz_widget.plot_experimental_with_exclusions(
+                freqs, V3, keep, range_mask=range_mask, title=title
+            )
+            self.status_bar.showMessage(
+                f"已加载实验数据：最终 {n_fit} 点参与拟合"
+                + (f"，剔除 {n_excl} 点" if n_excl else "")
+                + (f"，范围外 {n_out} 点" if n_out else "")
+            )
+            if switch_tab:
+                self.tabs.setCurrentWidget(self.viz_widget)
+
+        self.fitting_widget.set_preview_handler(_on_data_preview)
 
     def create_menu_bar(self):
         menubar = self.menuBar()

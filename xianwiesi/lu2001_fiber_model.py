@@ -186,11 +186,19 @@ def low_freq_limit_V3_amp(fiber: FiberGeometry, kappa: float) -> float:
 
 class FiberModelFitter:
     """
-    非线性最小二乘拟合 κ 和/或 C_p（或等价地 κ 与 γ）。
+    非线性最小二乘拟合材料参数和/或电学（传感器）参数。
 
-    拟合参数可选: 'kappa', 'C_p', 'rho'（少见）。
-    内部用 κ、C_p 正演；γ 由 α 推出。
+    材料: 'kappa', 'C_p', 'rho'
+    几何: 'L', 'D'（D 同步 S=πD²/4 与辐射直径）
+    电学/传感器: 'R', 'alpha_R', 'V_rms'（写入 fiber；R'=α_R·R，I=V/R）
+    兼容旧键 'R_prime'、'I_rms'。
+
+    驱动按电压源：界面/拟合用 V_rms，模型内 I_rms = V_rms / R。
+    改 R 时保持 V_rms 不变，同步 I_rms 与 R'。
     """
+
+    MATERIAL_KEYS = frozenset({'kappa', 'C_p', 'rho'})
+    FIBER_KEYS = frozenset({'L', 'D', 'R', 'alpha_R', 'R_prime', 'V_rms', 'I_rms'})
 
     def __init__(
         self,
@@ -204,35 +212,137 @@ class FiberModelFitter:
         use_eq24: bool = False,
         radiation: Optional[RadiationParams] = None,
         freq_window_2wgamma_max: float = 4.0,
+        alpha_R: Optional[float] = None,
+        diameter: Optional[float] = None,
+        V_rms: Optional[float] = None,
     ):
         self.freqs = np.asarray(freqs, dtype=float)
         self.V3_exp = np.asarray(V3_exp, dtype=complex)
-        self.fiber = fiber
+        self.fiber = FiberGeometry(
+            fiber.L, fiber.S, fiber.R, fiber.R_prime, fiber.I_rms)
         self.material = MaterialProps(material0.kappa, material0.rho, material0.C_p)
+        # α_R 独立于 R；未显式给出则由初值 R'/R 推得
+        if alpha_R is not None:
+            self.alpha_R = float(alpha_R)
+        elif abs(fiber.R) > 1e-30:
+            self.alpha_R = float(fiber.R_prime) / float(fiber.R)
+        else:
+            self.alpha_R = 0.0
+        self.fiber.R_prime = self.alpha_R * self.fiber.R
+        if V_rms is not None:
+            self.V_rms = float(V_rms)
+        else:
+            self.V_rms = float(fiber.I_rms) * float(fiber.R)
+        self._sync_I_from_V()
+        if diameter is not None and diameter > 0:
+            self.diameter = float(diameter)
+        else:
+            self.diameter = diameter_from_area(fiber.S) if fiber.S > 0 else 0.0
+        self._sync_S_from_D()
         self.params_to_fit = list(params_to_fit)
         self.fit_mode = fit_mode
         self.param_bounds = param_bounds or {}
         self.use_eq24 = use_eq24
         self.radiation = radiation
+        self._sync_radiation_D()
         self.freq_window_2wgamma_max = freq_window_2wgamma_max
         self.last_info: Dict[str, float] = {}
         self.success = False
         self.message = ''
         self.cost = np.nan
 
-        allowed = {'kappa', 'C_p', 'rho'}
+        allowed = self.MATERIAL_KEYS | self.FIBER_KEYS
         for p in self.params_to_fit:
             if p not in allowed:
-                raise ValueError(f"未知拟合参数 '{p}', 允许: {allowed}")
+                raise ValueError(f"未知拟合参数 '{p}', 允许: {sorted(allowed)}")
+        if 'alpha_R' in self.params_to_fit and 'R_prime' in self.params_to_fit:
+            raise ValueError("不能同时拟合 alpha_R 与 R_prime")
+        if 'V_rms' in self.params_to_fit and 'I_rms' in self.params_to_fit:
+            raise ValueError("不能同时拟合 V_rms 与 I_rms")
         if fit_mode not in ('amp', 'phase', 'both', 'real', 'imag'):
             raise ValueError("fit_mode 须为 amp|phase|both|real|imag")
 
+    def _sync_R_prime(self) -> None:
+        """R' = α_R · R（α_R 固定时改 R 只动 R'）。"""
+        self.fiber.R_prime = self.alpha_R * self.fiber.R
+
+    def _sync_I_from_V(self) -> None:
+        """电压源：I_rms = V_rms / R。"""
+        R = float(self.fiber.R)
+        if abs(R) < 1e-30:
+            raise ValueError("R 过小，无法由 V_rms 换算 I_rms")
+        self.fiber.I_rms = self.V_rms / R
+
+    def _sync_S_from_D(self) -> None:
+        """S = π D²/4。"""
+        if self.diameter > 0:
+            self.fiber.S = 0.25 * np.pi * self.diameter ** 2
+
+    def _sync_radiation_D(self) -> None:
+        if self.radiation is not None and self.diameter > 0:
+            self.radiation.diameter = self.diameter
+
+    def _get_param(self, p: str) -> float:
+        if p in self.MATERIAL_KEYS:
+            return float(getattr(self.material, p))
+        if p == 'alpha_R':
+            return float(self.alpha_R)
+        if p == 'D':
+            return float(self.diameter)
+        if p == 'V_rms':
+            return float(self.V_rms)
+        return float(getattr(self.fiber, p))
+
+    def _set_param(self, p: str, v: float) -> None:
+        if p in self.MATERIAL_KEYS:
+            setattr(self.material, p, float(v))
+            return
+        if p == 'alpha_R':
+            self.alpha_R = float(v)
+            self._sync_R_prime()
+            return
+        if p == 'R':
+            self.fiber.R = float(v)
+            self._sync_R_prime()
+            self._sync_I_from_V()
+            return
+        if p == 'R_prime':
+            # 旧接口：绝对 R'；反推 α_R，使后续改 R 仍按新 α_R 同步
+            self.fiber.R_prime = float(v)
+            if abs(self.fiber.R) > 1e-30:
+                self.alpha_R = self.fiber.R_prime / self.fiber.R
+            return
+        if p == 'V_rms':
+            self.V_rms = float(v)
+            self._sync_I_from_V()
+            return
+        if p == 'I_rms':
+            # 旧接口：绝对电流；反推 V=I·R
+            self.fiber.I_rms = float(v)
+            self.V_rms = self.fiber.I_rms * self.fiber.R
+            return
+        if p == 'D':
+            self.diameter = float(v)
+            self._sync_S_from_D()
+            self._sync_radiation_D()
+            return
+        if p == 'L':
+            self.fiber.L = float(v)
+            return
+        setattr(self.fiber, p, float(v))
+
     def _pack(self) -> np.ndarray:
-        return np.array([getattr(self.material, p) for p in self.params_to_fit], dtype=float)
+        return np.array([self._get_param(p) for p in self.params_to_fit], dtype=float)
 
     def _unpack(self, x: np.ndarray) -> None:
         for p, v in zip(self.params_to_fit, x):
-            setattr(self.material, p, float(v))
+            self._set_param(p, float(v))
+        # 若本步未改 α_R/R'，仍保证 R' 与当前 α_R、R 一致
+        if 'R_prime' not in self.params_to_fit:
+            self._sync_R_prime()
+        # 电压源：未单独拟合 I 时保持 I=V/R
+        if 'I_rms' not in self.params_to_fit:
+            self._sync_I_from_V()
 
     def _bounds_vectors(self) -> Tuple[np.ndarray, np.ndarray]:
         lo, hi = [], []
@@ -240,15 +350,31 @@ class FiberModelFitter:
             'kappa': (1e-3, 5e3),
             'C_p': (10.0, 5e3),
             'rho': (10.0, 3e4),
+            'L': (1e-5, 0.1),
+            'D': (1e-8, 1e-3),
+            'R': (1e-3, 1e5),
+            'alpha_R': (-0.1, 0.1),
+            'R_prime': (-10.0, 10.0),
+            'V_rms': (1e-6, 10.0),
+            'I_rms': (1e-6, 1.0),
         }
         for p in self.params_to_fit:
             if p in self.param_bounds:
                 a, b = self.param_bounds[p]
             else:
                 a, b = defaults[p]
+                if p in ('alpha_R', 'R_prime'):
+                    v0 = self._get_param(p)
+                    if abs(v0) > 0:
+                        a, b = (min(v0 * 0.1, v0 * 10.0), max(v0 * 0.1, v0 * 10.0))
+                        if v0 < 0:
+                            a, b = b, a
+                elif p in ('R', 'I_rms', 'V_rms', 'L', 'D'):
+                    v0 = abs(self._get_param(p)) or 1.0
+                    a, b = v0 * 0.1, v0 * 10.0
             lo.append(a)
             hi.append(b)
-        return np.array(lo), np.array(hi)
+        return np.array(lo, dtype=float), np.array(hi, dtype=float)
 
     def _residuals(self, x: np.ndarray) -> np.ndarray:
         self._unpack(x)
@@ -302,6 +428,156 @@ class FiberModelFitter:
         self.last_info = info
         return V3
 
+    def get_param_labels(self, params: Optional[Sequence[str]] = None) -> List[str]:
+        ps = list(params) if params is not None else list(self.params_to_fit)
+        return [FIBER_PARAM_LABELS.get(p, p) for p in ps]
+
+    def calculate_sensitivity_matrix(
+        self,
+        params: Optional[Sequence[str]] = None,
+        rel_step: float = 1e-6,
+    ) -> np.ndarray:
+        """D[k,f] = p_k · ∂V3/∂p_k（相对灵敏度缩放），复数。"""
+        return calculate_fiber_sensitivity_matrix(self, params=params, rel_step=rel_step)
+
+    def compute_parameter_correlation(
+        self,
+        params: Optional[Sequence[str]] = None,
+    ) -> Dict:
+        """基于当前解处的灵敏度矩阵计算参数相关系数。"""
+        return compute_fiber_parameter_correlation(self, params=params)
+
+
+# ---------------------------------------------------------------------------
+# 灵敏度 / 相关性（与块体软件 Fisher 分析同构）
+# ---------------------------------------------------------------------------
+FIBER_PARAM_LABELS: Dict[str, str] = {
+    'kappa': 'κ', 'C_p': 'C_p', 'rho': 'ρ',
+    'L': 'L', 'D': 'D',
+    'R': 'R', 'alpha_R': 'α_R', 'R_prime': "R'",
+    'V_rms': 'V_rms', 'I_rms': 'I_rms',
+}
+
+
+def _build_fisher_matrix_A(D_complex, V3_model, V3_exp, fit_mode: str) -> np.ndarray:
+    """由灵敏度矩阵构建 Fisher 信息矩阵 A ≈ JᵀJ。"""
+    if fit_mode == 'both':
+        rD, iD = D_complex.real, D_complex.imag
+        return rD @ rD.T + iD @ iD.T
+    if fit_mode == 'real':
+        rD = D_complex.real
+        return rD @ rD.T
+    if fit_mode == 'imag':
+        iD = D_complex.imag
+        return iD @ iD.T
+    if fit_mode == 'amp':
+        amp_model = np.maximum(np.abs(V3_model), 1e-30)
+        D_amp = np.real(np.conj(V3_model) * D_complex) / amp_model
+        return D_amp @ D_amp.T
+    if fit_mode == 'phase':
+        D_phase = np.imag(np.conj(V3_model) * D_complex) / np.maximum(
+            np.abs(V3_model) ** 2, 1e-30)
+        return D_phase @ D_phase.T
+    raise ValueError(f"Unknown fit_mode: {fit_mode}")
+
+
+def _correlation_from_fisher_matrix(A, labels, reg=1e-12) -> Dict:
+    """由 Fisher 矩阵求参数归一化相关系数矩阵。"""
+    n = A.shape[0]
+    if n == 0:
+        return {
+            'labels': [], 'matrix': np.array([]),
+            'strong_pairs': [], 'condition_number': np.nan,
+            'error': '无参与拟合的参数',
+        }
+    A_reg = A + np.eye(n) * reg
+    try:
+        cond = float(np.linalg.cond(A_reg))
+        C = np.linalg.inv(A_reg)
+    except np.linalg.LinAlgError:
+        return {
+            'labels': labels, 'matrix': None,
+            'strong_pairs': [], 'condition_number': np.inf,
+            'error': '矩阵奇异，无法计算参数相关性（可能存在不可辨识参数）',
+        }
+    std = np.sqrt(np.maximum(np.diag(C), 0.0))
+    corr = np.eye(n)
+    strong_pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if std[i] > 0 and std[j] > 0:
+                rho = float(np.clip(C[i, j] / (std[i] * std[j]), -1.0, 1.0))
+                corr[i, j] = corr[j, i] = rho
+                if abs(rho) >= 0.7:
+                    strong_pairs.append((labels[i], labels[j], rho))
+    strong_pairs.sort(key=lambda x: -abs(x[2]))
+    return {
+        'labels': labels,
+        'matrix': corr,
+        'strong_pairs': strong_pairs,
+        'condition_number': cond,
+        'error': None,
+    }
+
+
+def calculate_fiber_sensitivity_matrix(
+    fitter,
+    params: Optional[Sequence[str]] = None,
+    rel_step: float = 1e-6,
+) -> np.ndarray:
+    """对任意纤维 fitter：D[k,f] = p_k · ∂V3/∂p_k。"""
+    params = list(params) if params is not None else list(fitter.params_to_fit)
+    n = len(params)
+    n_f = len(fitter.freqs)
+    D = np.zeros((n, n_f), dtype=complex)
+    if n == 0:
+        return D
+
+    V3_base = fitter.predict(fitter.freqs)
+    for k, p in enumerate(params):
+        p0 = float(fitter._get_param(p))
+        delta = rel_step * p0 if abs(p0) > 0 else rel_step
+        fitter._set_param(p, p0 + delta)
+        if p != 'R_prime' and hasattr(fitter, '_sync_R_prime'):
+            if 'R_prime' not in getattr(fitter, 'params_to_fit', []):
+                fitter._sync_R_prime()
+        if p != 'I_rms' and hasattr(fitter, '_sync_I_from_V'):
+            if 'I_rms' not in getattr(fitter, 'params_to_fit', []):
+                try:
+                    fitter._sync_I_from_V()
+                except Exception:
+                    pass
+        V3_p = fitter.predict(fitter.freqs)
+        fitter._set_param(p, p0)
+        if p != 'R_prime' and hasattr(fitter, '_sync_R_prime'):
+            if 'R_prime' not in getattr(fitter, 'params_to_fit', []):
+                fitter._sync_R_prime()
+        if p != 'I_rms' and hasattr(fitter, '_sync_I_from_V'):
+            if 'I_rms' not in getattr(fitter, 'params_to_fit', []):
+                try:
+                    fitter._sync_I_from_V()
+                except Exception:
+                    pass
+        dV = (V3_p - V3_base) / delta
+        D[k, :] = p0 * dV
+    # 刷新基准 info
+    fitter.predict(fitter.freqs)
+    return D
+
+
+def compute_fiber_parameter_correlation(
+    fitter,
+    params: Optional[Sequence[str]] = None,
+) -> Dict:
+    params = list(params) if params is not None else list(fitter.params_to_fit)
+    labels = [FIBER_PARAM_LABELS.get(p, p) for p in params]
+    if not params:
+        return _correlation_from_fisher_matrix(np.zeros((0, 0)), labels)
+    D = calculate_fiber_sensitivity_matrix(fitter, params=params)
+    V3_model = fitter.predict(fitter.freqs)
+    A = _build_fisher_matrix_A(D, V3_model, fitter.V3_exp, fitter.fit_mode)
+    return _correlation_from_fisher_matrix(A, labels)
+
 
 def validity_report(
     fiber: FiberGeometry,
@@ -345,27 +621,56 @@ def validity_report(
     return "\n".join(lines)
 
 
-# 常用预设
+# 常用预设（V_rms 为驱动电压有效值；I_rms=V_rms/R，旧键 I_rms 仍可读）
 FIBER_PRESETS: Dict[str, dict] = {
     'platinum_20um_Lu': {
         # 论文 Sec.VI: D=20μm, L=8mm
         'L': 8e-3,
         'D': 20e-6,
         'R': 5.0,          # 需实测覆盖
-        'R_prime': 0.01,
-        'I_rms': 5e-3,
+        'alpha_R': 0.002,  # ≈ R'/R；旧键 R_prime 仍可读
+        'V_rms': 0.025,    # ≈ 5 mA × 5 Ω
+        'material': 'platinum',
+    },
+    # L=3 mm, D=50 μm；R 由室温电阻率×几何估算，α_R 为典型 TCR，实验请用实测覆盖
+    'nickel_50um': {
+        'L': 3e-3,
+        'D': 50e-6,
+        'R': 0.107,
+        'alpha_R': 0.006,
+        'V_rms': 0.00214,  # ≈ 20 mA × 0.107 Ω
+        'material': 'nickel',
+    },
+    'silver_50um': {
+        'L': 3e-3,
+        'D': 50e-6,
+        'R': 0.0243,
+        'alpha_R': 0.0038,
+        'V_rms': 4.86e-4,
+        'material': 'silver',
+    },
+    'gold_50um': {
+        'L': 3e-3,
+        'D': 50e-6,
+        'R': 0.0373,
+        'alpha_R': 0.0034,
+        'V_rms': 7.46e-4,
+        'material': 'gold',
     },
     'custom': {
         'L': 1e-3,
         'D': 10e-6,
         'R': 100.0,
-        'R_prime': 0.1,
-        'I_rms': 1e-3,
+        'alpha_R': 0.001,
+        'V_rms': 0.1,
     },
 }
 
 MATERIAL_PRESETS: Dict[str, MaterialProps] = {
     'platinum': MaterialProps(kappa=71.6, rho=21450.0, C_p=133.0),
+    'nickel': MaterialProps(kappa=90.7, rho=8908.0, C_p=445.0),
+    'silver': MaterialProps(kappa=429.0, rho=10490.0, C_p=235.0),
+    'gold': MaterialProps(kappa=317.0, rho=19300.0, C_p=129.0),
     'carbon_nanotube': MaterialProps(kappa=300.0, rho=1300.0, C_p=700.0),
     'copper': MaterialProps(kappa=401.0, rho=8960.0, C_p=385.0),
     'tungsten': MaterialProps(kappa=173.0, rho=19300.0, C_p=132.0),

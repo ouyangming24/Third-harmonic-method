@@ -675,21 +675,16 @@ class ThermalModelFitter:
 
             print(f"迭代 {j + 1}/{max_iter}: Epsilon = {epsilon:.4e}")
 
-            # 检查是否有参数触及边界
+            # 检查是否有参数触及边界（标签与 GUI 层编号一致：顶层=第1层）
             lower_bounds, upper_bounds = self._bounds_vector
             at_lower = np.isclose(new_params, lower_bounds, rtol=1e-6)
             at_upper = np.isclose(new_params, upper_bounds, rtol=1e-6)
             if np.any(at_lower) or np.any(at_upper):
-                bounded_params = []
-                for idx, p_map in enumerate(self._param_map):
-                    if at_lower[idx] or at_upper[idx]:
-                        if p_map['type'] == 'sensor':
-                            bounded_params.append(f"sensor.{p_map['prop']}")
-                        elif p_map['type'] == 'thickness_link':
-                            bounded_params.append(
-                                f"thickness(layer_{p_map['upper_idx']}+layer_{p_map['lower_idx']})")
-                        else:
-                            bounded_params.append(f"layer_{p_map['layer_idx']}.{p_map['prop']}")
+                labels = self.get_param_labels(gui_order=True)
+                bounded_params = [
+                    labels[idx] for idx in range(len(self._param_map))
+                    if at_lower[idx] or at_upper[idx]
+                ]
                 print(f"  警告: 以下参数触及边界: {', '.join(bounded_params)}")
 
             if epsilon < tol:
@@ -698,7 +693,7 @@ class ThermalModelFitter:
         else:
             print("警告: 已达到最大迭代次数但未收敛。")
 
-        # 输出拟合结果
+        # 输出拟合结果（详细层参数由 GUI 汇总展示，此处避免重复打印）
         if self.fit_type == 'sensor':
             print("\n最终拟合的传感器参数:")
             for p_map in self._param_map:
@@ -711,48 +706,8 @@ class ThermalModelFitter:
                     print(f"  {prop}: {val:.4e} (无约束)")
             return self.sensor_params
         elif self.fit_type == 'combined':
-            print("\n最终拟合的材料和传感器参数:")
-            for i, layer in enumerate(self.layers):
-                print(f"--- 第 {i} 层 ---")
-                layer_key = f'layer_{i}'
-                for prop, val in layer.items():
-                    # 检查是否是待拟合参数
-                    if layer_key in self.params_to_fit and prop in self.params_to_fit[layer_key]:
-                        # 检查是否有边界约束
-                        if layer_key in self.param_bounds and prop in self.param_bounds[layer_key]:
-                            bounds = self.param_bounds[layer_key][prop]
-                            print(f"  {prop}: {val:.4e} (边界: [{bounds[0]:.2e}, {bounds[1]:.2e}])")
-                        else:
-                            print(f"  {prop}: {val:.4e} (无约束)")
-                    else:
-                        print(f"  {prop}: {val:.4e}")
-            print("\n传感器参数:")
-            for prop in self.sensor_params:
-                if 'sensor' in self.params_to_fit and prop in self.params_to_fit['sensor']:
-                    val = self.sensor_params[prop]
-                    if 'sensor' in self.param_bounds and prop in self.param_bounds['sensor']:
-                        bounds = self.param_bounds['sensor'][prop]
-                        print(f"  {prop}: {val:.4e} (边界: [{bounds[0]:.2e}, {bounds[1]:.2e}])")
-                    else:
-                        print(f"  {prop}: {val:.4e} (无约束)")
-            # 返回包含材料层和传感器参数的字典
             return {'layers': self.layers, 'sensor_params': self.sensor_params}
         else:
-            print("\n最终拟合的材料属性:")
-            for i, layer in enumerate(self.layers):
-                print(f"--- 第 {i} 层 ---")
-                layer_key = f'layer_{i}'
-                for prop, val in layer.items():
-                    # 检查是否是待拟合参数
-                    if layer_key in self.params_to_fit and prop in self.params_to_fit[layer_key]:
-                        # 检查是否有边界约束
-                        if layer_key in self.param_bounds and prop in self.param_bounds[layer_key]:
-                            bounds = self.param_bounds[layer_key][prop]
-                            print(f"  {prop}: {val:.4e} (边界: [{bounds[0]:.2e}, {bounds[1]:.2e}])")
-                        else:
-                            print(f"  {prop}: {val:.4e} (无约束)")
-                    else:
-                        print(f"  {prop}: {val:.4e}")
             return self.layers
 
     def get_param_labels(self, gui_order=True):
@@ -990,10 +945,11 @@ class JointThermalModelFitter:
             at_lower = np.isclose(new_params, lower_bounds, rtol=1e-6)
             at_upper = np.isclose(new_params, upper_bounds, rtol=1e-6)
             if np.any(at_lower) or np.any(at_upper):
-                bounded_params = []
-                for idx, p_map in enumerate(self._param_map):
-                    if at_lower[idx] or at_upper[idx]:
-                        bounded_params.append(f"layer_{p_map['layer_idx']}.{p_map['prop']}")
+                labels = self.get_param_labels(gui_order=True)
+                bounded_params = [
+                    labels[idx] for idx in range(len(self._param_map))
+                    if at_lower[idx] or at_upper[idx]
+                ]
                 print(f"  警告: 以下参数触及边界: {', '.join(bounded_params)}")
 
             if epsilon < tol:
@@ -1002,19 +958,7 @@ class JointThermalModelFitter:
         else:
             print("警告: 已达到最大迭代次数但未收敛。")
 
-        print("\n最终拟合的材料属性 (联合拟合):")
-        for i, layer in enumerate(self.layers):
-            print(f"--- 第 {i} 层 ---")
-            layer_key = f'layer_{i}'
-            for prop, val in layer.items():
-                if layer_key in self.params_to_fit and prop in self.params_to_fit[layer_key]:
-                    if layer_key in self.param_bounds and prop in self.param_bounds[layer_key]:
-                        bounds = self.param_bounds[layer_key][prop]
-                        print(f"  {prop}: {val:.4e} (边界: [{bounds[0]:.2e}, {bounds[1]:.2e}])")
-                    else:
-                        print(f"  {prop}: {val:.4e} (无约束)")
-                else:
-                    print(f"  {prop}: {val:.4e}")
+        # 详细层参数由 GUI 汇总展示，避免与结果区重复
         return self.layers
 
     def get_param_labels(self, gui_order=True):

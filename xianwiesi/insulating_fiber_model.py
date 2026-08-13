@@ -136,7 +136,16 @@ def calculate_V3omega_insulating(
 
 
 class InsulatingFiberFitter:
-    """绝缘丝镀层 3ω：拟合 κ 和/或 C_p。"""
+    """
+    绝缘丝镀层 3ω：拟合材料 κ/C_p/ρ 和/或几何 L、D 与电学 R、α_R、V_rms。
+
+    驱动按电压源：V_rms 独立，I_rms = V_rms / R。
+    α_R 与 R 相互独立；拟合 D 时同步 S=πD²/4。
+    兼容旧键 'R_prime'、'I_rms'。
+    """
+
+    MATERIAL_KEYS = frozenset({'kappa', 'C_p', 'rho'})
+    FIBER_KEYS = frozenset({'L', 'D', 'R', 'alpha_R', 'R_prime', 'V_rms', 'I_rms'})
 
     def __init__(
         self,
@@ -149,40 +158,156 @@ class InsulatingFiberFitter:
         param_bounds: Optional[Dict[str, Tuple[float, float]]] = None,
         diameter: Optional[float] = None,
         radiation: Optional[RadiationParams] = None,
+        alpha_R: Optional[float] = None,
+        V_rms: Optional[float] = None,
     ):
         self.freqs = np.asarray(freqs, dtype=float)
         self.V3_exp = np.asarray(V3_exp, dtype=complex)
-        self.fiber = fiber
+        self.fiber = FiberGeometry(
+            fiber.L, fiber.S, fiber.R, fiber.R_prime, fiber.I_rms)
         self.material = MaterialProps(material0.kappa, material0.rho, material0.C_p)
+        if alpha_R is not None:
+            self.alpha_R = float(alpha_R)
+        elif abs(fiber.R) > 1e-30:
+            self.alpha_R = float(fiber.R_prime) / float(fiber.R)
+        else:
+            self.alpha_R = 0.0
+        self.fiber.R_prime = self.alpha_R * self.fiber.R
+        if V_rms is not None:
+            self.V_rms = float(V_rms)
+        else:
+            self.V_rms = float(fiber.I_rms) * float(fiber.R)
+        self._sync_I_from_V()
+        if diameter is not None and diameter > 0:
+            self.diameter = float(diameter)
+        else:
+            self.diameter = diameter_from_area(fiber.S) if fiber.S > 0 else 0.0
+        self._sync_S_from_D()
         self.params_to_fit = list(params_to_fit)
         self.fit_mode = fit_mode
         self.param_bounds = param_bounds or {}
-        self.diameter = diameter
         self.radiation = radiation
+        self._sync_radiation_D()
         self.last_info: Dict[str, float] = {}
         self.success = False
         self.message = ''
         self.cost = np.nan
 
+        allowed = self.MATERIAL_KEYS | self.FIBER_KEYS
+        for p in self.params_to_fit:
+            if p not in allowed:
+                raise ValueError(f"未知拟合参数 '{p}', 允许: {sorted(allowed)}")
+        if 'alpha_R' in self.params_to_fit and 'R_prime' in self.params_to_fit:
+            raise ValueError("不能同时拟合 alpha_R 与 R_prime")
+        if 'V_rms' in self.params_to_fit and 'I_rms' in self.params_to_fit:
+            raise ValueError("不能同时拟合 V_rms 与 I_rms")
+
+    def _sync_R_prime(self) -> None:
+        self.fiber.R_prime = self.alpha_R * self.fiber.R
+
+    def _sync_I_from_V(self) -> None:
+        R = float(self.fiber.R)
+        if abs(R) < 1e-30:
+            raise ValueError("R 过小，无法由 V_rms 换算 I_rms")
+        self.fiber.I_rms = self.V_rms / R
+
+    def _sync_S_from_D(self) -> None:
+        if self.diameter > 0:
+            self.fiber.S = 0.25 * np.pi * self.diameter ** 2
+
+    def _sync_radiation_D(self) -> None:
+        if self.radiation is not None and self.diameter > 0:
+            self.radiation.diameter = self.diameter
+
+    def _get_param(self, p: str) -> float:
+        if p in self.MATERIAL_KEYS:
+            return float(getattr(self.material, p))
+        if p == 'alpha_R':
+            return float(self.alpha_R)
+        if p == 'D':
+            return float(self.diameter)
+        if p == 'V_rms':
+            return float(self.V_rms)
+        return float(getattr(self.fiber, p))
+
+    def _set_param(self, p: str, v: float) -> None:
+        if p in self.MATERIAL_KEYS:
+            setattr(self.material, p, float(v))
+            return
+        if p == 'alpha_R':
+            self.alpha_R = float(v)
+            self._sync_R_prime()
+            return
+        if p == 'R':
+            self.fiber.R = float(v)
+            self._sync_R_prime()
+            self._sync_I_from_V()
+            return
+        if p == 'R_prime':
+            self.fiber.R_prime = float(v)
+            if abs(self.fiber.R) > 1e-30:
+                self.alpha_R = self.fiber.R_prime / self.fiber.R
+            return
+        if p == 'V_rms':
+            self.V_rms = float(v)
+            self._sync_I_from_V()
+            return
+        if p == 'I_rms':
+            self.fiber.I_rms = float(v)
+            self.V_rms = self.fiber.I_rms * self.fiber.R
+            return
+        if p == 'D':
+            self.diameter = float(v)
+            self._sync_S_from_D()
+            self._sync_radiation_D()
+            return
+        if p == 'L':
+            self.fiber.L = float(v)
+            return
+        setattr(self.fiber, p, float(v))
+
     def _pack(self) -> np.ndarray:
-        return np.array([getattr(self.material, p) for p in self.params_to_fit], dtype=float)
+        return np.array([self._get_param(p) for p in self.params_to_fit], dtype=float)
 
     def _unpack(self, x: np.ndarray) -> None:
         for p, v in zip(self.params_to_fit, x):
-            setattr(self.material, p, float(v))
+            self._set_param(p, float(v))
+        if 'R_prime' not in self.params_to_fit:
+            self._sync_R_prime()
+        if 'I_rms' not in self.params_to_fit:
+            self._sync_I_from_V()
 
     def _bounds_vectors(self):
         defaults = {
             'kappa': (1e-3, 5e3),
             'C_p': (10.0, 5e3),
             'rho': (10.0, 3e4),
+            'L': (1e-5, 0.1),
+            'D': (1e-8, 1e-3),
+            'R': (1e-3, 1e5),
+            'alpha_R': (-0.1, 0.1),
+            'R_prime': (-10.0, 10.0),
+            'V_rms': (1e-6, 10.0),
+            'I_rms': (1e-6, 1.0),
         }
         lo, hi = [], []
         for p in self.params_to_fit:
-            a, b = self.param_bounds.get(p, defaults[p])
+            if p in self.param_bounds:
+                a, b = self.param_bounds[p]
+            else:
+                a, b = defaults[p]
+                if p in ('alpha_R', 'R_prime'):
+                    v0 = self._get_param(p)
+                    if abs(v0) > 0:
+                        a, b = (min(v0 * 0.1, v0 * 10.0), max(v0 * 0.1, v0 * 10.0))
+                        if v0 < 0:
+                            a, b = b, a
+                elif p in ('R', 'I_rms', 'V_rms', 'L', 'D'):
+                    v0 = abs(self._get_param(p)) or 1.0
+                    a, b = v0 * 0.1, v0 * 10.0
             lo.append(a)
             hi.append(b)
-        return np.array(lo), np.array(hi)
+        return np.array(lo, dtype=float), np.array(hi, dtype=float)
 
     def _residuals(self, x: np.ndarray) -> np.ndarray:
         self._unpack(x)
@@ -231,6 +356,19 @@ class InsulatingFiberFitter:
         )
         self.last_info = info
         return V3
+
+    def get_param_labels(self, params=None):
+        from lu2001_fiber_model import FIBER_PARAM_LABELS
+        ps = list(params) if params is not None else list(self.params_to_fit)
+        return [FIBER_PARAM_LABELS.get(p, p) for p in ps]
+
+    def calculate_sensitivity_matrix(self, params=None, rel_step: float = 1e-6):
+        from lu2001_fiber_model import calculate_fiber_sensitivity_matrix
+        return calculate_fiber_sensitivity_matrix(self, params=params, rel_step=rel_step)
+
+    def compute_parameter_correlation(self, params=None):
+        from lu2001_fiber_model import compute_fiber_parameter_correlation
+        return compute_fiber_parameter_correlation(self, params=params)
 
 
 def validity_report_insulating(
