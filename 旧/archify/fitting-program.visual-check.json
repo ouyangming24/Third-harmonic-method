@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "visual-check",
+  "status": "fail",
+  "visualReview": "pending",
+  "artifact": {
+    "path": "e:\\company\\Aunion\\three_omega\\program\\Fitting program\\archify\\fitting-program.html",
+    "sha256": "af1f76a7a890898b6bbed39173cc66d38f96601e2302c9f951c9c5a08992cb9b",
+    "bytes": 654681
+  },
+  "state": {
+    "detail": "read",
+    "motion": "still"
+  },
+  "chrome": {
+    "status": "available",
+    "executable": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+  },
+  "containment": {
+    "status": "fail",
+    "viewports": []
+  },
+  "captures": {
+    "status": "fail",
+    "screenshots": [],
+    "contactSheet": null
+  },
+  "sidecars": {
+    "receipt": "fitting-program.visual-check.json",
+    "contactSheet": "fitting-program.visual-check.html"
+  },
+  "error": "Page.loadEventFired: event timed out after 15000ms"
+}

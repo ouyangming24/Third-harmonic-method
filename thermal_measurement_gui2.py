@@ -70,7 +70,7 @@ _MATPLOTLIB_CN_FONT = _configure_matplotlib_chinese_font()
 # 导入项目模块
 from olson_model26_3 import (
     ThermalModelFitter, JointThermalModelFitter, calculate_analytical_Z, convert_Z_to_V3,
-    FitCancelledError,
+    FitCancelledError, sync_layer_anisotropy, sync_layers_anisotropy, layer_is_isotropic,
 )
 from calibration_gui import CalibrationWidget
 from signal_calibration import SignalCalibrator
@@ -80,6 +80,7 @@ from balance_resistor import (
     BalanceResistorController, list_serial_ports, SERIAL_AVAILABLE as BALANCE_SERIAL_AVAILABLE,
 )
 from auto_balance import AutoBalanceThread, AutoBalanceConfig
+import film_report
 
 # 扫频时每个频点的滤波时间常数 τ = TC_FACTOR / f(Hz)，苏黎世 demods timeconstant 与 OE1300 OFLT 共用此关系
 LOCKIN_TC_FACTOR = 5.0
@@ -93,7 +94,38 @@ MODEL_SHEET_DATA = "Data"
 MODEL_SHEET_SENSOR = "Sensor"
 MODEL_SHEET_LAYERS = "Layers"
 MODEL_SHEET_META = "Meta"
-LAYER_PARAM_KEYS = ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']
+# 层参数：面外 k_y、面内 k_x（正演内部仍换算 ψ=k_x/k_y）；读旧文件时兼容 psi 列
+LAYER_PARAM_KEYS = ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']
+LAYER_PARAM_KEYS_LEGACY = LAYER_PARAM_KEYS + ['psi']
+LAYER_FLAG_KEYS = ['isotropic']
+
+
+def _layer_with_iso_flag(layer_data):
+    """复制层配置；旧配置没有 isotropic 字段时按 k_x 是否等于 k_y 推断。"""
+    layer = dict(layer_data)
+    if 'isotropic' in layer and str(layer['isotropic']).strip() not in ('', 'nan', 'None'):
+        return layer
+    try:
+        ky = float(layer['k_y'])
+        if 'k_x' in layer and str(layer['k_x']).strip() != '':
+            kx = float(layer['k_x'])
+        else:
+            kx = float(layer.get('psi', 1.0)) * ky
+        layer['isotropic'] = bool(np.isclose(kx, ky, rtol=1e-9, atol=0.0))
+    except (KeyError, TypeError, ValueError):
+        layer['isotropic'] = True
+    return layer
+
+
+def _format_layer_result_lines(layer):
+    """拟合结果文本：数值参数用科学计数法，各向同性标记用文字。"""
+    lines = []
+    for param, value in layer.items():
+        if param == 'isotropic':
+            lines.append(f"  各向同性: {'是（k_x = k_y）' if layer_is_isotropic(layer) else '否'}")
+        else:
+            lines.append(f"  {param}: {value:.6e}")
+    return lines
 # 界面传感器参数：用相对温度系数 α_R；模型内部仍用 dR_dT = α_R · R
 SENSOR_UI_PARAMS = ['b', 'L', 'R', 'alpha_R', 'V_rms', 'H_e', 'rho_C_e']
 SENSOR_UI_LABELS = [
@@ -197,7 +229,7 @@ def save_dataframe_with_model_config(filename, data_df, model_config=None):
             rows = []
             for i, layer in enumerate(layers):
                 row = {'layer': i + 1}
-                for p in LAYER_PARAM_KEYS:
+                for p in LAYER_PARAM_KEYS + LAYER_FLAG_KEYS:
                     if p in layer:
                         row[p] = layer[p]
                 rows.append(row)
@@ -233,11 +265,11 @@ def load_dataframe_with_model_config(filename):
             ldf = pd.read_excel(xl, sheet_name=MODEL_SHEET_LAYERS)
             for _, row in ldf.iterrows():
                 layer = {}
-                for p in LAYER_PARAM_KEYS:
+                for p in LAYER_PARAM_KEYS_LEGACY + LAYER_FLAG_KEYS:
                     if p in ldf.columns and pd.notna(row.get(p)):
                         layer[p] = row[p]
                 if layer:
-                    layers.append(layer)
+                    layers.append(sync_layer_anisotropy(layer))
         if MODEL_SHEET_META in sheets:
             mdf = pd.read_excel(xl, sheet_name=MODEL_SHEET_META)
             if 'param' in mdf.columns and 'value' in mdf.columns:
@@ -291,9 +323,14 @@ class MaterialDatabase:
             'picu (金属有机物混合)': {'k_y': 1.4, 'rho': 1850, 'cap': 1E3, 'H': 40e-6, 'psi': 1.0, 'Rc': 2.88e-5},
             'Custom (自定义)': {'k_y': 1.0, 'rho': 2000.0, 'cap': 1000.0, 'H': 1.0e-3, 'psi': 1.0, 'Rc': 1e-8}
         }
+        # 材料库补齐 k_x（默认各向同性 k_x=k_y）；保留 psi 仅供正演换算
+        for _props in self.materials.values():
+            sync_layer_anisotropy(_props)
 
     def get_material(self, name):
-        return self.materials.get(name, self.materials['Custom (自定义)']).copy()
+        return sync_layer_anisotropy(
+            self.materials.get(name, self.materials['Custom (自定义)']).copy()
+        )
 
     def get_material_names(self):
         return list(self.materials.keys())
@@ -849,14 +886,16 @@ class SimulationWidget(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"保存文件时出错:\n{str(e)}")
 
-    def _create_layer_op_button(self, text, tooltip, container, is_add):
+    def _create_layer_op_button(self, text, tooltip, container, role):
+        """role: 'add_above' | 'add_below' | 'remove'"""
         btn = QPushButton(text)
-        btn.setFixedSize(26, 26)
+        btn.setFixedSize(28, 26)
         btn.setToolTip(tooltip)
         btn.setProperty('layer_container', container)
-        if is_add:
+        btn.setProperty('layer_op', role)
+        if role in ('add_above', 'add_below'):
             btn.setStyleSheet(
-                "QPushButton { color: #4CAF50; font-weight: bold; font-size: 16px; "
+                "QPushButton { color: #4CAF50; font-weight: bold; font-size: 13px; "
                 "border: 1px solid #4CAF50; border-radius: 3px; padding: 0; }"
                 "QPushButton:hover { background-color: #E8F5E9; }"
             )
@@ -877,14 +916,17 @@ class SimulationWidget(QWidget):
         return -1
 
     def _on_layer_add_clicked(self):
-        container = self.sender().property('layer_container')
+        btn = self.sender()
+        container = btn.property('layer_container')
+        role = btn.property('layer_op') or 'add_above'
         idx = self._layer_index_of(container)
         if idx < 0:
             return
         if len(self.layer_widgets) >= 10:
             QMessageBox.warning(self, "提示", "材料层数最多为 10 层。")
             return
-        self.add_layer_ui(idx)
+        insert_at = idx if role == 'add_above' else idx + 1
+        self.add_layer_ui(insert_at)
 
     def _on_layer_remove_clicked(self):
         container = self.sender().property('layer_container')
@@ -928,9 +970,14 @@ class SimulationWidget(QWidget):
         title_label.setStyleSheet("font-weight: bold;")
         header.addWidget(title_label)
         header.addStretch()
-        btn_add = self._create_layer_op_button('+', "在该层上方插入新层", container, is_add=True)
-        btn_remove = self._create_layer_op_button('−', "删除该层", container, is_add=False)
-        header.addWidget(btn_add)
+        btn_above = self._create_layer_op_button(
+            '+↑', "在该层上方插入新层", container, role='add_above')
+        btn_below = self._create_layer_op_button(
+            '+↓', "在该层下方插入新层", container, role='add_below')
+        btn_remove = self._create_layer_op_button(
+            '−', "删除该层", container, role='remove')
+        header.addWidget(btn_above)
+        header.addWidget(btn_below)
         header.addWidget(btn_remove)
         container_layout.addLayout(header)
 
@@ -942,7 +989,7 @@ class SimulationWidget(QWidget):
         layout.addWidget(mat_combo, 0, 1)
 
         inputs = {}
-        props = ['k_y', 'rho', 'cap', 'H', 'Rc', 'psi']
+        props = ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']
         for i, p in enumerate(props):
             layout.addWidget(QLabel(p), i + 1, 0)
             inp = QLineEdit()
@@ -951,7 +998,32 @@ class SimulationWidget(QWidget):
             inputs[p] = inp
             layout.addWidget(inp, i + 1, 1)
 
-        mat_combo.currentTextChanged.connect(lambda t, inps=inputs: self.load_material(t, inps))
+        iso_check = QCheckBox("各向同性（k_x = k_y）")
+        layout.addWidget(iso_check, len(props) + 1, 0, 1, 2)
+
+        def apply_iso_state(checked, inps=inputs):
+            inps['k_x'].setReadOnly(checked)
+            inps['k_x'].setStyleSheet("background: #eeeeee;" if checked else "")
+            if checked:
+                inps['k_x'].setText(inps['k_y'].text())
+
+        def mirror_ky(text, chk=iso_check, inps=inputs):
+            if chk.isChecked():
+                inps['k_x'].setText(text)
+
+        def on_iso_toggled(checked):
+            apply_iso_state(checked)
+            if hasattr(self, 'param_list'):
+                self.update_param_list()
+            self.schedule_update()
+
+        iso_check.setChecked(True)
+        apply_iso_state(True)
+        iso_check.toggled.connect(on_iso_toggled)
+        inputs['k_y'].textChanged.connect(mirror_ky)
+
+        mat_combo.currentTextChanged.connect(
+            lambda t, inps=inputs, chk=iso_check: (chk.setChecked(True), self.load_material(t, inps)))
         self.load_material(mat_combo.currentText(), inputs)
 
         content = QWidget()
@@ -964,6 +1036,7 @@ class SimulationWidget(QWidget):
             'title_label': title_label,
             'inputs': inputs,
             'combo': mat_combo,
+            'iso_check': iso_check,
         })
 
         self._renumber_layer_ui_titles()
@@ -996,7 +1069,9 @@ class SimulationWidget(QWidget):
             else:
                 for i, layer_data in enumerate(layers):
                     self.add_layer_ui(i)
-                    for param, value in layer_data.items():
+                    synced = sync_layer_anisotropy(_layer_with_iso_flag(layer_data))
+                    self.layer_widgets[i]['iso_check'].setChecked(layer_is_isotropic(synced))
+                    for param, value in synced.items():
                         if param in self.layer_widgets[i]['inputs']:
                             self.layer_widgets[i]['inputs'][param].setText(str(value))
 
@@ -1040,7 +1115,8 @@ class SimulationWidget(QWidget):
     def load_material(self, name, inputs):
         data = self.material_db.get_material(name)
         for k, v in data.items():
-            inputs[k].setText(str(v))
+            if k in inputs:
+                inputs[k].setText(str(v))
         # load_material 改变了输入框文本，会自动触发 textChanged -> schedule_update
 
     def run_simulation(self, silent=False):
@@ -1063,7 +1139,7 @@ class SimulationWidget(QWidget):
                     val = v.text()
                     try:
                         f_val = np.inf if val == 'inf' else float(val)
-                        if f_val <= 0 and k in ['k_y', 'rho', 'cap', 'H'] and not (
+                        if f_val <= 0 and k in ['k_y', 'k_x', 'rho', 'cap', 'H'] and not (
                                 k == 'H' and i == len(self.layer_widgets) - 1):
                             # H 对于最底层(基底)可能不重要，但在GUI逻辑中它是最后一层
                             # 但因为我们要反转，所以GUI的最后一层其实是模型的第0层(基底)
@@ -1080,13 +1156,14 @@ class SimulationWidget(QWidget):
                         if not silent:
                             QMessageBox.warning(self, "参数错误", f"第 {i + 1} 层参数 {k} 无效: {str(ve)}")
                         return
+                l_data['isotropic'] = w['iso_check'].isChecked()
                 layers.append(l_data)
 
             # 4. 计算
             # 注意：Olson模型要求layers列表顺序为 [基底, ..., 顶层]
             # 而GUI通常是 [顶层, ..., 基底] (从上到下)
             # 因此这里需要反转layers列表传给模型
-            model_layers = layers[::-1]
+            model_layers = sync_layers_anisotropy(layers[::-1])
 
             # 额外检查：反转后，model_layers[0]是基底，model_layers[1:]是薄膜
             # 确保所有薄膜层的 H > 0
@@ -1252,6 +1329,8 @@ class SensitivityWidget(SimulationWidget):
         # 层参数
         for i, w in enumerate(self.layer_widgets):
             for p in w['inputs'].keys():
+                if p == 'k_x' and w['iso_check'].isChecked():
+                    continue
                 item = QListWidgetItem(f"Layer {i + 1}: {p}")
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Checked if p in ['k_y', 'Rc'] else Qt.Unchecked)
@@ -1307,6 +1386,7 @@ class SensitivityWidget(SimulationWidget):
                 for k, v in w['inputs'].items():
                     val = v.text()
                     l_data[k] = np.inf if val == 'inf' else float(val)
+                l_data['isotropic'] = w['iso_check'].isChecked()
                 layers.append(l_data)
 
             # 2. 计算基准值
@@ -1758,7 +1838,8 @@ class DataAcquisitionThread(QThread):
         # 滤波稳定等待：False=自动（τ×倍数，与苏黎世逻辑一致）；True=固定秒数
         self.wait_use_manual = False
         self.wait_manual_seconds = 5.0
-        self.integration_multiplier = 5  # 自动模式下 wait = τ * multiplier
+        self.integration_multiplier = 5.0  # 自动模式下 wait = τ * multiplier
+        self.tc_factor = float(LOCKIN_TC_FACTOR)  # τ = tc_factor / f(Hz)
         self.oe_snap_n_samples = OE1300_SNAP_SAMPLES_DEFAULT
         self.oe_snap_duration = OE1300_SNAP_DURATION_DEFAULT
 
@@ -1777,6 +1858,7 @@ class DataAcquisitionThread(QThread):
             wait_use_manual=False,
             wait_manual_seconds=5.0,
             integration_multiplier=5,
+            tc_factor=None,
             oe_snap_n_samples=None,
             oe_snap_duration=None,
     ):
@@ -1792,7 +1874,10 @@ class DataAcquisitionThread(QThread):
         self.oe_input_range_index = oe_input_range_index
         self.wait_use_manual = bool(wait_use_manual)
         self.wait_manual_seconds = float(wait_manual_seconds)
-        self.integration_multiplier = int(integration_multiplier)
+        self.integration_multiplier = float(integration_multiplier)
+        self.tc_factor = float(
+            LOCKIN_TC_FACTOR if tc_factor is None else tc_factor
+        )
         self.oe_snap_n_samples = (
             int(oe_snap_n_samples)
             if oe_snap_n_samples is not None
@@ -1861,8 +1946,9 @@ class DataAcquisitionThread(QThread):
                 self.progress_update.emit(progress, f"测量频率: {freq:.2f} Hz")
 
                 # 苏黎世与 OE1300：每个频点 τ 随 f 变化（与苏黎世 timeconstant / OE1300 OFLT 一致）
+                tc_fac = max(1e-6, float(self.tc_factor))
                 time_constant = (
-                    LOCKIN_TC_FACTOR / freq if freq > 0 else 0.1
+                    tc_fac / freq if freq > 0 else 0.1
                 )
 
                 self.lockin.configure_lockin(
@@ -1949,6 +2035,7 @@ class LiveMonitorThread(QThread):
         interval_s=0.5,
         oe_snap_n_samples=4,
         oe_snap_duration=0.4,
+        tc_factor=None,
     ):
         self.cfg = dict(
             lockin_backend=(lockin_backend or 'zurich').lower(),
@@ -1964,6 +2051,9 @@ class LiveMonitorThread(QThread):
             interval_s=max(0.2, float(interval_s)),
             oe_snap_n_samples=max(1, int(oe_snap_n_samples)),
             oe_snap_duration=max(0.05, float(oe_snap_duration)),
+            tc_factor=float(
+                LOCKIN_TC_FACTOR if tc_factor is None else tc_factor
+            ),
         )
         self._diff_on = bool(diff_on)
         self._diff_dirty = True
@@ -2011,7 +2101,8 @@ class LiveMonitorThread(QThread):
             backend = c['lockin_backend']
             self.lockin = self._connect()
             freq = max(1e-6, c['freq_hz'])
-            tc = LOCKIN_TC_FACTOR / freq
+            tc_fac = max(1e-6, float(c.get('tc_factor', LOCKIN_TC_FACTOR)))
+            tc = tc_fac / freq
             self._set_output(self.lockin, c['output_v'])
             self.lockin.configure_lockin(freq=freq, order_time=4, time_constant=tc)
             while not self._stop:
@@ -2378,13 +2469,15 @@ class LockInControlWidget(QWidget):
         # 频率设置
         param_layout.addWidget(QLabel("起始频率 (Hz):"), 0, 0)
         self.freq_start = QDoubleSpinBox()
-        self.freq_start.setRange(0.1, 100000000)
+        self.freq_start.setDecimals(6)
+        self.freq_start.setRange(0.001, 100000000)
         self.freq_start.setValue(10)
         param_layout.addWidget(self.freq_start, 0, 1)
 
         param_layout.addWidget(QLabel("结束频率 (Hz):"), 0, 2)
         self.freq_end = QDoubleSpinBox()
-        self.freq_end.setRange(0.1, 100000000)
+        self.freq_end.setDecimals(6)
+        self.freq_end.setRange(0.001, 100000000)
         self.freq_end.setValue(1000)
         param_layout.addWidget(self.freq_end, 0, 3)
 
@@ -2415,34 +2508,58 @@ class LockInControlWidget(QWidget):
         self.measurement_count.setValue(1)
         param_layout.addWidget(self.measurement_count, 2, 3)
 
-        # 滤波器稳定等待
-        param_layout.addWidget(QLabel("稳定等待:"), 3, 0)
+        # 滤波器时间常数与稳定等待
+        param_layout.addWidget(QLabel("τ 系数 (τ=系数/f):"), 3, 0)
+        self.tc_factor_spin = QDoubleSpinBox()
+        self.tc_factor_spin.setRange(0.01, 1e6)
+        self.tc_factor_spin.setDecimals(3)
+        self.tc_factor_spin.setSingleStep(0.5)
+        self.tc_factor_spin.setValue(float(LOCKIN_TC_FACTOR))
+        self.tc_factor_spin.setToolTip(
+            "每个频点写入锁相的滤波时间常数 τ = 系数 / 频率(Hz)。"
+            "苏黎世 demods.timeconstant 与 OE1300 OFLT 共用。"
+        )
+        param_layout.addWidget(self.tc_factor_spin, 3, 1)
+
+        param_layout.addWidget(QLabel("自动等待倍数 (×τ):"), 3, 2)
+        self.wait_mult_spin = QDoubleSpinBox()
+        self.wait_mult_spin.setRange(0.1, 1000.0)
+        self.wait_mult_spin.setDecimals(2)
+        self.wait_mult_spin.setSingleStep(0.5)
+        self.wait_mult_spin.setValue(5.0)
+        self.wait_mult_spin.setToolTip(
+            "不勾选「手动指定等待」时：每个频点等待时间 = τ × 本倍数。"
+        )
+        param_layout.addWidget(self.wait_mult_spin, 3, 3)
+
+        param_layout.addWidget(QLabel("稳定等待:"), 4, 0)
         self.wait_manual_check = QCheckBox("手动指定等待时间 (秒)")
         self.wait_manual_check.setChecked(False)
         self.wait_manual_check.setToolTip(
-            f"不勾选：每个频点等待时间 = 时间常数 × 5；"
-            f"时间常数 τ = {LOCKIN_TC_FACTOR:g}/频率(Hz)。勾选：使用固定秒数。"
+            "不勾选：等待 = τ ×「自动等待倍数」；"
+            "勾选：使用右侧固定秒数（仍按 τ 系数设置锁相滤波）。"
         )
-        param_layout.addWidget(self.wait_manual_check, 3, 1)
-        param_layout.addWidget(QLabel("固定等待 (s):"), 3, 2)
+        param_layout.addWidget(self.wait_manual_check, 4, 1)
+        param_layout.addWidget(QLabel("固定等待 (s):"), 4, 2)
         self.wait_manual_spin = QDoubleSpinBox()
         self.wait_manual_spin.setRange(0.0, 7200.0)
         self.wait_manual_spin.setDecimals(2)
         self.wait_manual_spin.setSingleStep(0.5)
         self.wait_manual_spin.setValue(5.0)
         self.wait_manual_spin.setEnabled(False)
-        param_layout.addWidget(self.wait_manual_spin, 3, 3)
+        param_layout.addWidget(self.wait_manual_spin, 4, 3)
 
-        self.wait_auto_hint = QLabel(
-            f"自动等待 = τ×5，τ = {LOCKIN_TC_FACTOR:g}/f(Hz)"
-        )
+        self.wait_auto_hint = QLabel("")
         self.wait_auto_hint.setStyleSheet("QLabel { color: #555; font-size: 11px; }")
-        param_layout.addWidget(self.wait_auto_hint, 4, 0, 1, 4)
+        param_layout.addWidget(self.wait_auto_hint, 5, 0, 1, 4)
 
         self.wait_manual_check.toggled.connect(self._on_wait_manual_toggled)
+        self.tc_factor_spin.valueChanged.connect(self._update_wait_auto_hint)
+        self.wait_mult_spin.valueChanged.connect(self._update_wait_auto_hint)
         self._on_wait_manual_toggled(self.wait_manual_check.isChecked())
+        self._update_wait_auto_hint()
 
-        param_layout.addWidget(QLabel("信号缩放倍数:"), 5, 0)
+        param_layout.addWidget(QLabel("信号缩放倍数:"), 6, 0)
         self.signal_scale_spin = QDoubleSpinBox()
         self.signal_scale_spin.setRange(1e-6, 1e6)
         self.signal_scale_spin.setDecimals(6)
@@ -2451,25 +2568,25 @@ class LockInControlWidget(QWidget):
         self.signal_scale_spin.setToolTip(
             "对 V3/V1 幅值等乘以该系数；相位与频率不缩放。"
         )
-        param_layout.addWidget(self.signal_scale_spin, 5, 1)
+        param_layout.addWidget(self.signal_scale_spin, 6, 1)
 
-        param_layout.addWidget(QLabel("OE SNAP次数:"), 5, 2)
+        param_layout.addWidget(QLabel("OE SNAP次数:"), 6, 2)
         self.oe_snap_samples_spin = QSpinBox()
         self.oe_snap_samples_spin.setRange(1, 500)
         self.oe_snap_samples_spin.setValue(OE1300_SNAP_SAMPLES_DEFAULT)
         self.oe_snap_samples_spin.setToolTip("仅 OE1300；每个频点 SNAP 次数")
-        param_layout.addWidget(self.oe_snap_samples_spin, 5, 3)
+        param_layout.addWidget(self.oe_snap_samples_spin, 6, 3)
 
-        param_layout.addWidget(QLabel("OE读数时长(s):"), 6, 0)
+        param_layout.addWidget(QLabel("OE读数时长(s):"), 7, 0)
         self.oe_snap_duration_spin = QDoubleSpinBox()
         self.oe_snap_duration_spin.setRange(0.05, 600.0)
         self.oe_snap_duration_spin.setDecimals(2)
         self.oe_snap_duration_spin.setSingleStep(0.1)
         self.oe_snap_duration_spin.setValue(OE1300_SNAP_DURATION_DEFAULT)
-        param_layout.addWidget(self.oe_snap_duration_spin, 6, 1)
+        param_layout.addWidget(self.oe_snap_duration_spin, 7, 1)
         self.oe_snap_hint = QLabel("OE SNAP 项仅 OE1300 生效")
         self.oe_snap_hint.setStyleSheet("QLabel { color: #555; font-size: 11px; }")
-        param_layout.addWidget(self.oe_snap_hint, 6, 2, 1, 2)
+        param_layout.addWidget(self.oe_snap_hint, 7, 2, 1, 2)
 
         # 右侧：实时监视
         monitor_box = QGroupBox("实时监视 (1ω / 3ω)")
@@ -2644,7 +2761,16 @@ class LockInControlWidget(QWidget):
 
     def _on_wait_manual_toggled(self, checked: bool):
         self.wait_manual_spin.setEnabled(checked)
+        self.wait_mult_spin.setEnabled(not checked)
         self.wait_auto_hint.setVisible(not checked)
+        self._update_wait_auto_hint()
+
+    def _update_wait_auto_hint(self, *_args):
+        tc = float(self.tc_factor_spin.value())
+        mult = float(self.wait_mult_spin.value())
+        self.wait_auto_hint.setText(
+            f"当前：τ = {tc:g}/f(Hz)；自动等待 = τ×{mult:g}"
+        )
 
     def _signal_scale_k(self) -> float:
         return float(self.signal_scale_spin.value())
@@ -2963,6 +3089,7 @@ class LockInControlWidget(QWidget):
             interval_s=float(self.monitor_interval_spin.value()),
             oe_snap_n_samples=max(2, min(8, self.oe_snap_samples_spin.value())),
             oe_snap_duration=min(0.6, float(self.oe_snap_duration_spin.value())),
+            tc_factor=self.tc_factor_spin.value(),
         )
         self.monitor_start_btn.setEnabled(False)
         self.monitor_stop_btn.setEnabled(True)
@@ -3250,7 +3377,8 @@ class LockInControlWidget(QWidget):
             oe_input_range_index=oe_irng,
             wait_use_manual=self.wait_manual_check.isChecked(),
             wait_manual_seconds=self.wait_manual_spin.value(),
-            integration_multiplier=5,
+            integration_multiplier=self.wait_mult_spin.value(),
+            tc_factor=self.tc_factor_spin.value(),
             oe_snap_n_samples=self.oe_snap_samples_spin.value(),
             oe_snap_duration=self.oe_snap_duration_spin.value(),
         )
@@ -3335,6 +3463,390 @@ class LockInControlWidget(QWidget):
             QMessageBox.information(self, "成功", f"数据已保存到:\n{filename}{extra}")
 
 
+def slope_method_estimate(freqs, V3, sensor, f_min, f_max):
+    """斜率法：线性区内同相温升对 ln f 线性回归，k = −P / (2π L · 斜率)。
+
+    sensor 为模型格式（含 b, L, R, dR_dT, V_rms, H_e, rho_C_e）。
+    各向异性层得到的是 √(k_x·k_y)。
+    """
+    freqs = np.asarray(freqs, dtype=float)
+    V3 = np.asarray(V3, dtype=complex)
+    b = float(sensor['b'])
+    L = float(sensor['L'])
+    R = float(sensor['R'])
+    V = float(sensor['V_rms'])
+    dRdT = float(sensor['dR_dT'])
+    H_e = float(sensor.get('H_e', 0.0) or 0.0)
+    rho_C_e = float(sensor.get('rho_C_e', 0.0) or 0.0)
+    if min(b, L, R, V) <= 0 or dRdT == 0:
+        raise ValueError("传感器参数 b、L、R、V_rms 须 > 0，α_R 不能为 0")
+
+    Z_hat = -(4.0 * R ** 2 * b * L) / (V ** 3 * dRdT) * V3
+    with np.errstate(divide='ignore', invalid='ignore'):
+        Z = 1.0 / (1.0 / Z_hat + 1j * 4.0 * np.pi * freqs * H_e * rho_C_e)
+    P = V ** 2 / R
+    dT_in = -P * Z.real / (2.0 * b * L)
+
+    valid = np.isfinite(freqs) & (freqs > 0) & np.isfinite(dT_in)
+    sel = valid & (freqs >= f_min) & (freqs <= f_max)
+    n = int(np.sum(sel))
+    if n < 3:
+        raise ValueError(f"所选频段内只有 {n} 个有效点，至少需要 3 个")
+
+    x = np.log(freqs[sel])
+    y = dT_in[sel]
+    x_mean = x.mean()
+    sxx = float(np.sum((x - x_mean) ** 2))
+    if sxx <= 0:
+        raise ValueError("所选频段内频率相同，无法回归")
+    slope = float(np.sum((x - x_mean) * (y - y.mean())) / sxx)
+    intercept = float(y.mean() - slope * x_mean)
+    resid = y - (slope * x + intercept)
+    ss_res = float(np.sum(resid ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    slope_se = float(np.sqrt(ss_res / (n - 2) / sxx)) if n > 2 else np.nan
+
+    k = -P / (2.0 * np.pi * L * slope) if slope != 0 else np.nan
+    k_se = abs(k) * slope_se / abs(slope) if slope != 0 else np.nan
+    f_sel = freqs[sel]
+    return {
+        'k': k, 'k_se': k_se, 'slope': slope, 'slope_se': slope_se,
+        'intercept': intercept, 'r2': r2, 'n': n, 'P': P,
+        'f_lo': float(f_sel.min()), 'f_hi': float(f_sel.max()),
+        'decades': float(np.log10(f_sel.max() / f_sel.min())),
+        'freqs': freqs[valid], 'dT_in': dT_in[valid], 'sel': sel[valid],
+        'resid': resid, 'f_resid': f_sel,
+    }
+
+
+class SlopeMethodDialog(QDialog):
+    """斜率法估算热导率：选线性区频段 → 线性回归 → 可写入某层 k_y 初值。"""
+
+    def __init__(self, fitting_widget, freqs, V3, sensor, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("斜率法估算热导率")
+        self.resize(900, 780)
+        self.fw = fitting_widget
+        self.freqs = np.asarray(freqs, dtype=float)
+        self.V3 = np.asarray(V3, dtype=complex)
+        self.sensor = sensor
+        self.result = None
+
+        lay = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("线性区 f_min (Hz):"))
+        self.fmin_edit = QLineEdit()
+        self.fmin_edit.setMaximumWidth(110)
+        top.addWidget(self.fmin_edit)
+        top.addWidget(QLabel("f_max (Hz):"))
+        self.fmax_edit = QLineEdit()
+        self.fmax_edit.setMaximumWidth(110)
+        top.addWidget(self.fmax_edit)
+        self.use_pen_btn = QPushButton("用穿透深度分析的建议窗口")
+        self.use_pen_btn.clicked.connect(self._use_penetration_window)
+        top.addWidget(self.use_pen_btn)
+        self.calc_btn = QPushButton("计算")
+        self.calc_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; padding: 4px 14px; }")
+        self.calc_btn.clicked.connect(self.compute)
+        top.addWidget(self.calc_btn)
+        top.addStretch()
+        lay.addLayout(top)
+
+        self.window_hint = QLabel()
+        self.window_hint.setStyleSheet("color:#666;")
+        self.window_hint.setWordWrap(True)
+        lay.addWidget(self.window_hint)
+
+        self.report = QTextEdit()
+        self.report.setReadOnly(True)
+        self.report.setFont(QFont("Consolas", 10))
+        self.report.setMaximumHeight(200)
+        lay.addWidget(self.report)
+
+        self.figure = Figure(figsize=(8, 5))
+        self.canvas = FigureCanvas(self.figure)
+        lay.addWidget(self.canvas, 1)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(QLabel("写入到:"))
+        self.layer_combo = QComboBox()
+        n_layers = len(self.fw.layer_widgets)
+        for i in range(n_layers):
+            tag = "（基底）" if i == n_layers - 1 else ("（顶层）" if i == 0 else "")
+            self.layer_combo.addItem(f"第 {i + 1} 层{tag}", i)
+        if n_layers:
+            self.layer_combo.setCurrentIndex(n_layers - 1)
+        bottom.addWidget(self.layer_combo)
+        self.apply_btn = QPushButton("设为该层 k_y 初值")
+        self.apply_btn.setEnabled(False)
+        self.apply_btn.clicked.connect(self._apply_to_layer)
+        bottom.addWidget(self.apply_btn)
+        bottom.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        bottom.addWidget(close_btn)
+        lay.addLayout(bottom)
+
+        self.fmin_edit.setText(f"{self.freqs.min():.6g}")
+        self.fmax_edit.setText(f"{self.freqs.max():.6g}")
+        self.window_hint.setText("默认为全部数据频段。")
+        if not self._use_penetration_window(silent=True):
+            self.window_hint.setText(
+                "默认为全部数据频段。建议先在「📐 穿透深度分析」页同步参数并分析，"
+                "得到基底线性区窗口后再点上方按钮。")
+        self.compute()
+
+    def _penetration_result(self):
+        pen = getattr(self.fw, '_penetration_source', None)
+        res = getattr(pen, 'last_result', None) if pen is not None else None
+        if res and res.get('window_ok'):
+            return res
+        return None
+
+    def _use_penetration_window(self, silent=False):
+        res = self._penetration_result()
+        if res is None:
+            if not silent:
+                QMessageBox.information(
+                    self, "提示",
+                    "暂无有效的建议窗口。\n请先在「📐 穿透深度分析」页点「从数据拟合同步参数」并「开始分析」。")
+            return False
+        lo = max(float(res['f_rec_min']), float(self.freqs.min()))
+        hi = min(float(res['f_rec_max']), float(self.freqs.max()))
+        if lo >= hi:
+            if not silent:
+                QMessageBox.warning(
+                    self, "提示",
+                    f"建议窗口 {res['f_rec_min']:.4g} ~ {res['f_rec_max']:.4g} Hz 与数据频段没有交集。")
+            return False
+        self.fmin_edit.setText(f"{lo:.6g}")
+        self.fmax_edit.setText(f"{hi:.6g}")
+        self.window_hint.setText(
+            f"已采用穿透深度分析的建议窗口 {res['f_rec_min']:.4g} ~ {res['f_rec_max']:.4g} Hz"
+            f"（与数据频段取交集）。该窗口基于分析页当时的参数，参数改动后请重新分析。")
+        if not silent:
+            self.compute()
+        return True
+
+    def compute(self):
+        try:
+            f_min = float(self.fmin_edit.text())
+            f_max = float(self.fmax_edit.text())
+            if f_min <= 0 or f_max <= f_min:
+                raise ValueError("请确认 0 < f_min < f_max")
+            r = slope_method_estimate(self.freqs, self.V3, self.sensor, f_min, f_max)
+        except Exception as e:
+            self.result = None
+            self.apply_btn.setEnabled(False)
+            self.report.setPlainText(f"计算失败：{e}")
+            self.figure.clear()
+            self.canvas.draw()
+            return
+
+        self.result = r
+        ok = np.isfinite(r['k']) and r['k'] > 0
+        self.apply_btn.setEnabled(bool(ok))
+
+        lines = [
+            "【斜率法】ΔT_同相 = a + s·ln f，k = −P / (2π L s)",
+            f"  频段: {r['f_lo']:.4g} ~ {r['f_hi']:.4g} Hz（{r['decades']:.2f} 个数量级），点数 n = {r['n']}",
+            f"  加热功率 P = V²/R = {r['P']:.4g} W",
+            f"  斜率 s = {r['slope']:.4e} ± {r['slope_se']:.2e} K / ln(Hz)",
+        ]
+        if ok:
+            rel = r['k_se'] / r['k'] * 100 if r['k'] else np.nan
+            lines.append(f"  ➜ k = {r['k']:.4g} ± {r['k_se']:.2g} W/(m·K)（相对标准误差 {rel:.2f}%）")
+            lines.append("    各向异性层对应 √(k_x·k_y)；各向同性层即 k")
+        else:
+            lines.append("  ❌ 斜率 ≥ 0（同相温升未随频率降低），无法得到正的热导率："
+                         "请检查频段、相位/信号校正或传感器参数")
+        lines.append(f"  线性度 R² = {r['r2']:.5f}，残差 RMS = {np.sqrt(np.mean(r['resid'] ** 2)):.3e} K")
+
+        warns = []
+        if r['decades'] < 0.5:
+            warns.append("频段不足半个数量级，斜率对噪声很敏感")
+        elif r['decades'] < 1.0:
+            warns.append("频段不足一个数量级，结果仅供参考")
+        if r['n'] < 5:
+            warns.append("点数少于 5")
+        if np.isfinite(r['r2']) and r['r2'] < 0.99:
+            warns.append("R² < 0.99：频段内可能混入过渡带，或噪声较大")
+        if r['n'] >= 6 and r['slope'] != 0:
+            xr = np.log(r['f_resid'])
+            yr = r['resid'] + r['slope'] * xr + r['intercept']
+            c2 = np.polyfit(xr, yr, 2)[0]
+            slope_change = abs(2.0 * c2 * (xr.max() - xr.min()) / r['slope'])
+            if slope_change > 0.05:
+                warns.append(f"曲线有弯曲：频段两端局部斜率相差约 {slope_change * 100:.0f}%，"
+                             "频段可能混入过渡带，建议收窄")
+        if warns:
+            lines.append("")
+            lines.append("【注意】")
+            lines.extend(f"  ⚠️ {w}" for w in warns)
+        lines.append("")
+        lines.append("注: 结果依赖 V_rms³、α_R、L、R 的准确度；界面热阻与薄膜只影响截距，不影响斜率。")
+        self.report.setPlainText("\n".join(lines))
+        self._plot(r)
+
+    def _plot(self, r):
+        _configure_matplotlib_chinese_font()
+        self.figure.clear()
+        gs = self.figure.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.08)
+        ax = self.figure.add_subplot(gs[0])
+        axr = self.figure.add_subplot(gs[1])
+
+        f_all, dT_all, sel = r['freqs'], r['dT_in'], r['sel']
+        xlim = (f_all.min() / 1.3, f_all.max() * 1.3)
+        ax.semilogx(f_all[~sel], dT_all[~sel], 'o', color='#bbbbbb', ms=4, label='频段外')
+        ax.semilogx(f_all[sel], dT_all[sel], 'o', color='#1f77b4', ms=5, label='参与回归')
+        f_line = np.logspace(np.log10(f_all.min()), np.log10(f_all.max()), 200)
+        ax.semilogx(f_line, r['intercept'] + r['slope'] * np.log(f_line), '-', color='#d62728', lw=1.2,
+                    alpha=0.4)
+        f_fit = np.logspace(np.log10(r['f_lo']), np.log10(r['f_hi']), 100)
+        k_txt = f"k = {r['k']:.4g} W/(m·K)" if np.isfinite(r['k']) and r['k'] > 0 else "k 无效"
+        ax.semilogx(f_fit, r['intercept'] + r['slope'] * np.log(f_fit), '-', color='#d62728', lw=2,
+                    label=f"线性拟合  {k_txt}")
+        ax.axvspan(r['f_lo'], r['f_hi'], color='#4CAF50', alpha=0.10)
+        ax.set_ylabel('同相温升 ΔT (K)')
+        ax.grid(True, which='both', ls='--', alpha=0.3)
+        ax.legend(fontsize='small', loc='best')
+        ax.tick_params(labelbottom=False)
+
+        axr.semilogx(r['f_resid'], r['resid'], 'o', color='#1f77b4', ms=4)
+        axr.axhline(0, color='#d62728', lw=1)
+        axr.axvspan(r['f_lo'], r['f_hi'], color='#4CAF50', alpha=0.10)
+        axr.set_ylabel('残差 (K)')
+        axr.set_xlabel('频率 f (Hz)')
+        axr.grid(True, which='both', ls='--', alpha=0.3)
+        ax.set_xlim(*xlim)
+        axr.set_xlim(*xlim)
+        self.canvas.draw()
+
+    def _apply_to_layer(self):
+        if not self.result or not np.isfinite(self.result['k']) or self.result['k'] <= 0:
+            return
+        idx = self.layer_combo.currentData()
+        if idx is None or idx >= len(self.fw.layer_widgets):
+            return
+        k = self.result['k']
+        w = self.fw.layer_widgets[idx]
+        w['inputs']['k_y'].setText(f"{k:.6g}")
+        if self.fw._layer_is_iso_in_gui(idx):
+            msg = f"已将第 {idx + 1} 层 k_y 初值设为 {k:.6g} W/(m·K)（各向同性，k_x 同步）。"
+        else:
+            msg = (f"已将第 {idx + 1} 层 k_y 初值设为 {k:.6g} W/(m·K)。\n"
+                   "该层为各向异性：斜率给出的是 √(k_x·k_y)，k_y 初值仅作近似，k_x 未改动。")
+        if hasattr(self.fw, 'results_text'):
+            self.fw.results_text.append(
+                f"✓ 斜率法：{self.result['f_lo']:.4g}~{self.result['f_hi']:.4g} Hz，"
+                f"k = {k:.4g} ± {self.result['k_se']:.2g} W/(m·K)，R² = {self.result['r2']:.4f}"
+                f" → 第 {idx + 1} 层 k_y 初值")
+        QMessageBox.information(self, "已写入", msg)
+
+
+class ReportInfoDialog(QDialog):
+    """导出实验报告前填写样品与测试条件。"""
+
+    ENVIRONMENTS = ["大气（室温）", "真空（< 2 Pa）", "高真空（< 1e-2 Pa）", "氮气保护"]
+
+    def __init__(self, layer_names, cached=None, has_slope=False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("实验报告信息")
+        self.resize(560, 560)
+        cached = cached or {}
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.sample_name = QLineEdit(cached.get('sample_name', ''))
+        self.sample_id = QLineEdit(cached.get('sample_id', ''))
+        self.temperature = QLineEdit(cached.get('temperature', '25'))
+        self.environment = QComboBox()
+        self.environment.setEditable(True)
+        self.environment.addItems(self.ENVIRONMENTS)
+        if cached.get('environment'):
+            self.environment.setCurrentText(cached['environment'])
+        self.operator = QLineEdit(cached.get('operator', ''))
+        self.test_date = QLineEdit(cached.get('test_date', today))
+        self.report_date = QLineEdit(today)
+        self.note = QLineEdit(cached.get('note', ''))
+        self.note.setPlaceholderText("可选：样品制备、加热线材料等补充说明")
+        form.addRow("样品名称:", self.sample_name)
+        form.addRow("样品编号:", self.sample_id)
+        form.addRow("测试温度 (℃):", self.temperature)
+        form.addRow("测试环境:", self.environment)
+        form.addRow("测试人员:", self.operator)
+        form.addRow("测试日期:", self.test_date)
+        form.addRow("报告日期:", self.report_date)
+        form.addRow("备注:", self.note)
+        lay.addLayout(form)
+
+        names_box = QGroupBox("各层材料名称（第 1 层为顶层，最后一层为基底）")
+        names_form = QFormLayout(names_box)
+        self.layer_name_edits = []
+        for i, name in enumerate(layer_names):
+            edit = QLineEdit(name)
+            tag = "（基底）" if i == len(layer_names) - 1 else ""
+            names_form.addRow(f"第 {i + 1} 层{tag}:", edit)
+            self.layer_name_edits.append(edit)
+        lay.addWidget(names_box)
+
+        opt_box = QGroupBox("报告内容")
+        opt_lay = QVBoxLayout(opt_box)
+        self.pm20_cb = QCheckBox("拟合曲线叠加各拟合参数 ±20% 正演曲线")
+        self.pm20_cb.setChecked(cached.get('include_pm20', True))
+        self.appendix_cb = QCheckBox("附录列出拟合数据表")
+        self.appendix_cb.setChecked(cached.get('include_appendix', True))
+        self.slope_cb = QCheckBox("包含最近一次斜率法结果（交叉验证）")
+        self.slope_cb.setChecked(has_slope)
+        self.slope_cb.setEnabled(has_slope)
+        if not has_slope:
+            self.slope_cb.setToolTip("尚未运行「斜率法估算」")
+        opt_lay.addWidget(self.pm20_cb)
+        opt_lay.addWidget(self.appendix_cb)
+        opt_lay.addWidget(self.slope_cb)
+        img_row = QHBoxLayout()
+        img_row.addWidget(QLabel("仪器照片:"))
+        self.image_path = QLineEdit(cached.get('image_path', ''))
+        self.image_path.setPlaceholderText("留空则使用默认 Harmonic ONE 照片")
+        img_row.addWidget(self.image_path, 1)
+        browse = QPushButton("浏览…")
+        browse.clicked.connect(self._browse_image)
+        img_row.addWidget(browse)
+        opt_lay.addLayout(img_row)
+        lay.addWidget(opt_box)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("下一步：选择保存位置")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _browse_image(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择照片", "", "Images (*.png *.jpg *.jpeg)")
+        if path:
+            self.image_path.setText(path)
+
+    def values(self):
+        return {
+            'sample_name': self.sample_name.text().strip(),
+            'sample_id': self.sample_id.text().strip(),
+            'temperature': self.temperature.text().strip(),
+            'environment': self.environment.currentText().strip(),
+            'operator': self.operator.text().strip(),
+            'test_date': self.test_date.text().strip(),
+            'report_date': self.report_date.text().strip(),
+            'note': self.note.text().strip(),
+            'layer_names': [e.text().strip() for e in self.layer_name_edits],
+            'include_pm20': self.pm20_cb.isChecked(),
+            'include_appendix': self.appendix_cb.isChecked(),
+            'include_slope': self.slope_cb.isChecked(),
+            'image_path': self.image_path.text().strip(),
+        }
+
+
 class FittingWidget(QWidget):
     """数据拟合界面"""
 
@@ -3380,12 +3892,13 @@ class FittingWidget(QWidget):
             sensor[param] = inp.text().strip()
 
         layers = []
-        layer_params = ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']
+        layer_params = ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']
         for w in self.layer_widgets:
             layer = {}
             for param in layer_params:
                 if param in w['inputs']:
                     layer[param] = w['inputs'][param].text().strip()
+            layer['isotropic'] = w['iso_check'].isChecked()
             layers.append(layer)
         cfg = {'sensor': sensor, 'layers': layers}
         fr = self.get_frequency_range()
@@ -3442,7 +3955,9 @@ class FittingWidget(QWidget):
             for i, layer_data in enumerate(layers):
                 if i >= len(self.layer_widgets):
                     break
-                for param, value in layer_data.items():
+                synced = sync_layer_anisotropy(_layer_with_iso_flag(layer_data))
+                self.layer_widgets[i]['iso_check'].setChecked(layer_is_isotropic(synced))
+                for param, value in synced.items():
                     if param in self.layer_widgets[i]['inputs']:
                         self.layer_widgets[i]['inputs'][param].setText(str(value))
             self._sync_tc_range()
@@ -3501,6 +4016,7 @@ class FittingWidget(QWidget):
 
     def _begin_fitting_ui(self):
         self._fit_cancel_requested = False
+        self._last_fit_cancelled = False
         self.fit_btn.setEnabled(False)
         self.stop_fit_btn.setEnabled(True)
 
@@ -3514,6 +4030,7 @@ class FittingWidget(QWidget):
 
     def _request_stop_fitting(self):
         self._fit_cancel_requested = True
+        self._last_fit_cancelled = True
         self.stop_fit_btn.setEnabled(False)
         self.results_text.append("\n正在中止拟合...\n")
         QApplication.processEvents()
@@ -3582,14 +4099,14 @@ class FittingWidget(QWidget):
             self.results_text.append("\n拟合的材料参数:")
             for i, layer in enumerate(fitted_result['layers']):
                 self.results_text.append(f"\n第 {i + 1} 层:")
-                for param, value in layer.items():
-                    self.results_text.append(f"  {param}: {value:.6e}")
+                for line in _format_layer_result_lines(layer):
+                    self.results_text.append(line)
         else:
             self.results_text.append("拟合的材料参数:")
             for i, layer in enumerate(fitted_result):
                 self.results_text.append(f"\n第 {i + 1} 层:")
-                for param, value in layer.items():
-                    self.results_text.append(f"  {param}: {value:.6e}")
+                for line in _format_layer_result_lines(layer):
+                    self.results_text.append(line)
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -3716,11 +4233,26 @@ class FittingWidget(QWidget):
             "QPushButton { background-color: #607D8B; color: white; font-size: 16px; padding: 10px; }")
         self.prefit_corr_btn.setToolTip(
             "基于当前初值与已勾选的拟合参数，预判参数耦合程度（无需先运行拟合）")
+        self.slope_btn = QPushButton("斜率法估算")
+        self.slope_btn.setStyleSheet(
+            "QPushButton { background-color: #009688; color: white; font-size: 16px; padding: 10px; }")
+        self.slope_btn.setToolTip(
+            "线性区内同相温升对 ln f 线性回归，k = −P/(2πL·斜率)；\n"
+            "可作为全模型拟合的初值或交叉验证（各向异性层给出 √(k_x·k_y)）")
+        self.slope_btn.clicked.connect(self.open_slope_method)
         control_layout.addWidget(self.fit_btn)
         control_layout.addWidget(self.stop_fit_btn)
         control_layout.addWidget(self.prefit_corr_btn)
+        control_layout.addWidget(self.slope_btn)
+        self.export_report_btn = QPushButton("导出实验报告")
+        self.export_report_btn.setStyleSheet(
+            "QPushButton { background-color: #6A1B9A; color: white; font-size: 16px; padding: 10px; }")
+        self.export_report_btn.setToolTip(
+            "生成含测量原理（Olson 多层模型）、样品结构示意、热物性结果、拟合曲线与数据附录的报告（PDF / HTML）")
+        self.export_report_btn.clicked.connect(self.export_experiment_report)
         control_layout.addWidget(self.export_btn)
         control_layout.addWidget(self.export_fitted_data_btn)
+        control_layout.addWidget(self.export_report_btn)
         layout.addLayout(control_layout)
 
         # 底部结果区：四块横向并列
@@ -3950,14 +4482,16 @@ class FittingWidget(QWidget):
 
         return widget
 
-    def _create_fitting_layer_op_button(self, text, tooltip, container, is_add):
+    def _create_fitting_layer_op_button(self, text, tooltip, container, role):
+        """role: 'add_above' | 'add_below' | 'remove'"""
         btn = QPushButton(text)
-        btn.setFixedSize(26, 26)
+        btn.setFixedSize(28, 26)
         btn.setToolTip(tooltip)
         btn.setProperty('layer_container', container)
-        if is_add:
+        btn.setProperty('layer_op', role)
+        if role in ('add_above', 'add_below'):
             btn.setStyleSheet(
-                "QPushButton { color: #4CAF50; font-weight: bold; font-size: 16px; "
+                "QPushButton { color: #4CAF50; font-weight: bold; font-size: 13px; "
                 "border: 1px solid #4CAF50; border-radius: 3px; padding: 0; }"
                 "QPushButton:hover { background-color: #E8F5E9; }"
             )
@@ -3978,14 +4512,17 @@ class FittingWidget(QWidget):
         return -1
 
     def _on_fitting_layer_add_clicked(self):
-        container = self.sender().property('layer_container')
+        btn = self.sender()
+        container = btn.property('layer_container')
+        role = btn.property('layer_op') or 'add_above'
         idx = self._fitting_layer_index_of(container)
         if idx < 0:
             return
         if len(self.layer_widgets) >= 10:
             QMessageBox.warning(self, "提示", "材料层数最多为 10 层。")
             return
-        self.add_layer_widget(idx)
+        insert_at = idx if role == 'add_above' else idx + 1
+        self.add_layer_widget(insert_at)
 
     def _on_fitting_layer_remove_clicked(self):
         container = self.sender().property('layer_container')
@@ -4019,9 +4556,14 @@ class FittingWidget(QWidget):
         title_label.setStyleSheet("font-weight: bold;")
         header.addWidget(title_label)
         header.addStretch()
-        btn_add = self._create_fitting_layer_op_button('+', "在该层上方插入新层", container, is_add=True)
-        btn_remove = self._create_fitting_layer_op_button('−', "删除该层", container, is_add=False)
-        header.addWidget(btn_add)
+        btn_above = self._create_fitting_layer_op_button(
+            '+↑', "在该层上方插入新层", container, role='add_above')
+        btn_below = self._create_fitting_layer_op_button(
+            '+↓', "在该层下方插入新层", container, role='add_below')
+        btn_remove = self._create_fitting_layer_op_button(
+            '−', "删除该层", container, role='remove')
+        header.addWidget(btn_above)
+        header.addWidget(btn_below)
         header.addWidget(btn_remove)
         container_layout.addLayout(header)
 
@@ -4035,12 +4577,14 @@ class FittingWidget(QWidget):
         layout.addWidget(material_combo, 0, 1, 1, 3)
 
         # 参数输入
-        params = ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']
-        labels = ['热导率 k_y (W/mK)', '密度 ρ (kg/m³)', '比热容 c_p (J/kg·K)',
-                  '厚度 H (m)', '各向异性因子 ψ', '界面热阻 Rc (K·m²/W)']
-        units = ['W/mK', 'kg/m³', 'J/kg·K', 'm', '', 'K·m²/W']
+        params = ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']
+        labels = ['面外热导率 k_y (W/mK)', '面内热导率 k_x (W/mK)', '密度 ρ (kg/m³)',
+                  '比热容 c_p (J/kg·K)', '厚度 H (m)', '界面热阻 Rc (K·m²/W)']
+        units = ['W/mK', 'W/mK', 'kg/m³', 'J/kg·K', 'm', 'K·m²/W']
 
         inputs = {}
+        fit_checks = {}
+        bound_inputs = {}
         for i, (param, label, unit) in enumerate(zip(params, labels, units)):
             row = i + 1
             layout.addWidget(QLabel(label + ":"), row, 0)
@@ -4054,6 +4598,7 @@ class FittingWidget(QWidget):
             # 是否拟合复选框
             fit_checkbox = QCheckBox("拟合")
             fit_checkbox.setObjectName(f"layer_{layer_index}_{param}_fit")
+            fit_checks[param] = fit_checkbox
             layout.addWidget(fit_checkbox, row, 2)
 
             # 参数边界设置
@@ -4073,8 +4618,36 @@ class FittingWidget(QWidget):
             max_input.setPlaceholderText("最大值")
             max_input.setMaximumWidth(80)
             bounds_layout.addWidget(max_input)
+            bound_inputs[param] = (min_input, max_input)
 
             layout.addLayout(bounds_layout, row, 3)
+
+        iso_check = QCheckBox("各向同性（k_x = k_y）")
+        iso_check.setObjectName(f"layer_{layer_index}_isotropic")
+        iso_check.setToolTip(
+            "勾选：面内热导率始终等于面外，拟合 k_y 时 k_x 同步变化。\n"
+            "取消：k_x 独立，可固定或单独拟合（各向异性样品）。")
+        layout.addWidget(iso_check, len(params) + 1, 0, 1, 4)
+
+        def apply_iso_state(checked, inps=inputs, fits=fit_checks, bnds=bound_inputs):
+            kx_inp = inps['k_x']
+            kx_inp.setReadOnly(checked)
+            kx_inp.setStyleSheet("background: #eeeeee;" if checked else "")
+            if checked:
+                kx_inp.setText(inps['k_y'].text())
+                fits['k_x'].setChecked(False)
+            fits['k_x'].setEnabled(not checked)
+            for w in bnds['k_x']:
+                w.setEnabled(not checked)
+
+        def mirror_ky(text, chk=iso_check, inps=inputs):
+            if chk.isChecked():
+                inps['k_x'].setText(text)
+
+        iso_check.toggled.connect(apply_iso_state)
+        inputs['k_y'].textChanged.connect(mirror_ky)
+        iso_check.setChecked(True)
+        apply_iso_state(True)
 
         # 连接预设选择信号
         material_combo.currentTextChanged.connect(
@@ -4090,6 +4663,7 @@ class FittingWidget(QWidget):
             'container': container,
             'title_label': title_label,
             'inputs': inputs,
+            'iso_check': iso_check,
         })
 
         material_combo.setCurrentIndex(0)
@@ -4117,8 +4691,10 @@ class FittingWidget(QWidget):
         self._sync_tc_range()
 
     def load_material_preset(self, layer_index, material_name):
-        """加载材料预设值"""
+        """加载材料预设值（预设均为各向同性）"""
         material = self.material_db.get_material(material_name)
+        if 0 <= layer_index < len(self.layer_widgets):
+            self.layer_widgets[layer_index]['iso_check'].setChecked(True)
 
         for param, value in material.items():
             input_name = f"layer_{layer_index}_{param}"
@@ -4411,7 +4987,7 @@ class FittingWidget(QWidget):
 
         show_material_fit = (not is_sensor_only) or is_combined
         for layer_idx in range(len(self.layer_widgets)):
-            for param in ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']:
+            for param in ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']:
                 checkbox = self.findChild(QCheckBox, f"layer_{layer_idx}_{param}_fit")
                 if checkbox:
                     checkbox.setVisible(show_material_fit)
@@ -4554,14 +5130,17 @@ class FittingWidget(QWidget):
                     name, disp = self._sensor_result_display(param, value, sp)
                     self._append_result_row("传感器参数", name, disp)
             for idx, layer in enumerate(fitted_result['layers']):
-                for param, value in layer.items():
-                    if self._was_layer_param_fitted(idx, param):
-                        self._append_result_row(f"第 {idx + 1} 层", param, value)
+                self._append_layer_result_rows(idx, layer)
         else:
             for idx, layer in enumerate(fitted_result):
-                for param, value in layer.items():
-                    if self._was_layer_param_fitted(idx, param):
-                        self._append_result_row(f"第 {idx + 1} 层", param, value)
+                self._append_layer_result_rows(idx, layer)
+
+    def _append_layer_result_rows(self, idx, layer):
+        for param, value in layer.items():
+            if self._was_layer_param_fitted(idx, param):
+                self._append_result_row(f"第 {idx + 1} 层", param, value)
+        if self._was_layer_param_fitted(idx, 'k_y') and layer_is_isotropic(layer):
+            self._append_result_row(f"第 {idx + 1} 层", "k_x（各向同性，= k_y）", layer['k_x'])
 
     def _get_fit_method_code(self):
         fit_method_map = {
@@ -4578,13 +5157,17 @@ class FittingWidget(QWidget):
         layers = []
         for i in range(len(self.layer_widgets)):
             layer = {}
-            for param in ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']:
+            for param in LAYER_PARAM_KEYS:
                 input_widget = self.findChild(QLineEdit, f"layer_{i}_{param}")
                 if input_widget:
                     text = input_widget.text()
                     layer[param] = np.inf if text.lower() == 'inf' else float(text)
-            layers.append(layer)
+            layer['isotropic'] = self._layer_is_iso_in_gui(i)
+            layers.append(sync_layer_anisotropy(layer))
         return layers
+
+    def _layer_is_iso_in_gui(self, i):
+        return self.layer_widgets[i]['iso_check'].isChecked()
 
     def _collect_sensor_params_from_gui(self):
         """从界面收集传感器参数，并换算为模型所需的 dR_dT。"""
@@ -4607,7 +5190,7 @@ class FittingWidget(QWidget):
             for i, layer in enumerate(layers):
                 layer_params_to_fit = []
                 layer_bounds = {}
-                for param in ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']:
+                for param in ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']:
                     if param == 'H' and i in skip_h_layers:
                         continue
                     checkbox = self.findChild(QCheckBox, f"layer_{i}_{param}_fit")
@@ -4620,14 +5203,14 @@ class FittingWidget(QWidget):
                         else:
                             if param == 'k_y':
                                 layer_bounds[param] = (0.01, 5000)
+                            elif param == 'k_x':
+                                layer_bounds[param] = (0.01, 5000)
                             elif param == 'rho':
                                 layer_bounds[param] = (100, 20000)
                             elif param == 'cap':
                                 layer_bounds[param] = (100, 5000)
                             elif param == 'Rc':
                                 layer_bounds[param] = (0, 1e-3)
-                            elif param == 'psi':
-                                layer_bounds[param] = (0.01, 100)
                             else:
                                 current_val = layer[param]
                                 layer_bounds[param] = (current_val * 0.1, current_val * 10)
@@ -4950,6 +5533,8 @@ class FittingWidget(QWidget):
                 self.fitting_data, model_config = load_dataframe_with_model_config(filename)
 
                 self.data_file_label.setText(f"已加载: {os.path.basename(filename)}")
+                self._loaded_data_filename = os.path.basename(filename)
+                self._last_slope_result = None
                 freqs = self.fitting_data.iloc[:, 0].values.astype(float)
                 self.initialize_frequency_filters(freqs)
                 # 导入只重置为全部保留，绝不自动检测/剔除
@@ -5324,7 +5909,7 @@ class FittingWidget(QWidget):
             layers = []
             for i in range(len(self.layer_widgets)):
                 layer = {}
-                for param in ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']:
+                for param in ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']:
                     input_widget = self.findChild(QLineEdit, f"layer_{i}_{param}")
                     if input_widget:
                         text = input_widget.text()
@@ -5332,7 +5917,9 @@ class FittingWidget(QWidget):
                             layer[param] = np.inf
                         else:
                             layer[param] = float(text)
+                layer['isotropic'] = self._layer_is_iso_in_gui(i)
                 layers.append(layer)
+            layers = sync_layers_anisotropy(layers)
 
             # 获取拟合参数
             params_to_fit = {}
@@ -5340,7 +5927,7 @@ class FittingWidget(QWidget):
             for i in range(len(self.layer_widgets)):
                 layer_params_to_fit = []
                 layer_bounds = {}
-                for param in ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']:
+                for param in ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']:
                     checkbox = self.findChild(QCheckBox, f"layer_{i}_{param}_fit")
                     if checkbox and checkbox.isChecked():
                         layer_params_to_fit.append(param)
@@ -5351,14 +5938,14 @@ class FittingWidget(QWidget):
                         else:
                             if param == 'k_y':
                                 layer_bounds[param] = (0.01, 5000)
+                            elif param == 'k_x':
+                                layer_bounds[param] = (0.01, 5000)
                             elif param == 'rho':
                                 layer_bounds[param] = (100, 20000)
                             elif param == 'cap':
                                 layer_bounds[param] = (100, 5000)
                             elif param == 'Rc':
                                 layer_bounds[param] = (0, 1e-3)
-                            elif param == 'psi':
-                                layer_bounds[param] = (0.01, 100)
                             else:
                                 current_val = layers[i][param]
                                 layer_bounds[param] = (current_val * 0.1, current_val * 10)
@@ -5524,7 +6111,7 @@ class FittingWidget(QWidget):
             layers = []
             for i in range(len(self.layer_widgets)):
                 layer = {}
-                for param in ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']:
+                for param in ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']:
                     input_widget = self.findChild(QLineEdit, f"layer_{i}_{param}")
                     if input_widget:
                         text = input_widget.text()
@@ -5532,7 +6119,9 @@ class FittingWidget(QWidget):
                             layer[param] = np.inf
                         else:
                             layer[param] = float(text)
+                layer['isotropic'] = self._layer_is_iso_in_gui(i)
                 layers.append(layer)
+            layers = sync_layers_anisotropy(layers)
 
             # 确定拟合参数
             mode = self.fit_mode.currentText()
@@ -5738,6 +6327,240 @@ class FittingWidget(QWidget):
                 if hasattr(self, 'figure') and hasattr(self.figure, 'canvas'):
                     self.figure.canvas.draw()
 
+    def open_slope_method(self):
+        """斜率法：使用全部频点（仍尊重剔点与信号校正），频段在对话框中选择。"""
+        if self.fitting_data is None:
+            QMessageBox.warning(self, "警告", "请先加载数据文件！")
+            return
+        try:
+            sensor = self._collect_sensor_params_from_gui()
+        except ValueError as e:
+            QMessageBox.warning(self, "警告", str(e))
+            return
+        freqs, V3 = self._parse_v3_arrays_from_fitting_data()
+        if self.point_keep_mask is not None and len(self.point_keep_mask) == len(freqs):
+            freqs, V3 = freqs[self.point_keep_mask], V3[self.point_keep_mask]
+        if len(freqs) < 3:
+            QMessageBox.warning(self, "警告", "有效数据点不足 3 个。")
+            return
+        calibrator = self._get_calibrator()
+        if self.apply_calibration_cb.isChecked() and calibrator is not None and calibrator.is_calibrated:
+            V3 = calibrator.correct_v3omega(freqs, V3)
+        dlg = SlopeMethodDialog(self, freqs, V3, sensor, parent=self)
+        dlg.exec_()
+        if dlg.result is not None and np.isfinite(dlg.result.get('k', np.nan)):
+            self._last_slope_result = dict(dlg.result)
+            self._last_slope_result['layer_idx'] = dlg.layer_combo.currentData()
+
+    def _gui_layer_names(self):
+        names = []
+        for i in range(len(self.layer_widgets)):
+            combo = self.findChild(QComboBox, f"layer_{i}_preset")
+            text = combo.currentText().strip() if combo is not None else ""
+            names.append("" if text in ("", "自定义", "Custom") else text)
+        return names
+
+    def export_experiment_report(self):
+        fitter = getattr(self, 'fitter', None)
+        if fitter is None or getattr(self, 'fitted_result', None) is None:
+            QMessageBox.warning(self, "提示", "请先完成一次拟合，再导出实验报告。")
+            return
+        n_fit_layers = len(fitter.layers)
+        if n_fit_layers != len(self.layer_widgets):
+            QMessageBox.warning(
+                self, "提示",
+                f"当前层数（{len(self.layer_widgets)}）与最近一次拟合的层数（{n_fit_layers}）不一致，"
+                "请重新拟合后再导出。")
+            return
+
+        cached = dict(getattr(self, '_report_info_cache', None) or {})
+        names = self._gui_layer_names()
+        old_names = cached.get('layer_names') or []
+        if len(old_names) == len(names):
+            names = [o or n for o, n in zip(old_names, names)]
+        slope = getattr(self, '_last_slope_result', None)
+        dlg = ReportInfoDialog(names, cached, has_slope=slope is not None, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        info = dlg.values()
+        self._report_info_cache = info
+
+        stem = re.sub(r'[\\/:*?"<>|]+', '_', info['sample_name'] or "3omega实验报告")
+        default_name = f"{stem}_{datetime.now().strftime('%Y%m%d')}.pdf"
+        path, selected = QFileDialog.getSaveFileName(
+            self, "导出实验报告", default_name, "PDF 实验报告 (*.pdf);;HTML 实验报告 (*.html)")
+        if not path:
+            return
+        want_pdf = path.lower().endswith('.pdf') or (
+            not path.lower().endswith(('.html', '.htm')) and 'PDF' in selected)
+        if want_pdf and not path.lower().endswith('.pdf'):
+            path += '.pdf'
+        elif not want_pdf and not path.lower().endswith(('.html', '.htm')):
+            path += '.html'
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ctx = self._build_report_context(fitter, info)
+            html_text = film_report.build_film_experiment_html(ctx)
+            if want_pdf:
+                import tempfile
+                fd, tmp_html = tempfile.mkstemp(suffix='.html', prefix='film_report_')
+                os.close(fd)
+                try:
+                    with open(tmp_html, 'w', encoding='utf-8') as f:
+                        f.write(html_text)
+                    film_report.html_file_to_pdf(tmp_html, path)
+                finally:
+                    try:
+                        os.remove(tmp_html)
+                    except OSError:
+                        pass
+            else:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(html_text)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            traceback.print_exc()
+            QMessageBox.critical(self, "导出失败", f"生成实验报告时出错：\n{e}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        self.results_text.append(f"\n✓ 实验报告已导出: {path}\n")
+        QMessageBox.information(self, "完成", f"实验报告已导出：\n{path}")
+        try:
+            os.startfile(path)
+        except Exception:
+            pass
+
+    def _build_report_context(self, fitter, info):
+        """汇总最近一次拟合的参数、不确定度、拟合曲线与 ±20% 正演，供 film_report 生成报告。"""
+        is_joint = isinstance(fitter, JointThermalModelFitter)
+        model_layers = [dict(l) for l in fitter.layers]
+        gui_layers = model_layers[::-1]
+        names = info.get('layer_names') or []
+        spec = getattr(self, '_last_fitted_param_spec', None) or {}
+
+        try:
+            unc = fitter.compute_parameter_uncertainty(gui_order=True)
+        except Exception as e:
+            unc = {'error': str(e)}
+        sigma_layers, sigma_sensor = {}, {}
+        if not unc.get('error') and unc.get('sigma_abs') is not None:
+            for label, s_abs, s_rel in zip(unc['labels'], unc['sigma_abs'], unc['sigma_rel']):
+                m = re.match(r"第(\d+)层\.(.+)", label)
+                if m:
+                    sigma_layers.setdefault(int(m.group(1)) - 1, {})[m.group(2)] = (float(s_abs), float(s_rel))
+                elif label.startswith("传感器."):
+                    sigma_sensor[label.split('.', 1)[1]] = (float(s_abs), float(s_rel))
+
+        layers_ctx = []
+        for i, L in enumerate(gui_layers):
+            fitted = list(spec.get('layers', {}).get(i, []))
+            if i in spec.get('thickness_layers', []):
+                fitted.append('H')
+            layers_ctx.append({
+                'name': names[i] if i < len(names) else '',
+                'H': L.get('H'), 'k_y': L.get('k_y'), 'k_x': L.get('k_x'),
+                'rho': L.get('rho'), 'cap': L.get('cap'), 'Rc': L.get('Rc', 0.0),
+                'isotropic': layer_is_isotropic(L),
+                'fitted': fitted,
+                'sigma': sigma_layers.get(i, {}),
+            })
+
+        def sensor_entry(label, b, sp, fitted_keys, sigma):
+            params = dict(sp)
+            params['b'] = b
+            R = float(params.get('R', 0) or 0)
+            params['alpha_R'] = float(params['dR_dT']) / R if R else float('nan')
+            fitted = set(fitted_keys)
+            sig = dict(sigma)
+            if 'dR_dT' in fitted:
+                fitted.add('alpha_R')
+                if 'dR_dT' in sig and R:
+                    sig['alpha_R'] = (sig['dR_dT'][0] / R, sig['dR_dT'][1])
+            return {'label': label, 'params': params, 'fitted': fitted, 'sigma': sig}
+
+        include_pm20 = info.get('include_pm20', True)
+        V = VisualizationWidget
+        n_layers = len(model_layers)
+        datasets, sensors = [], []
+        if is_joint:
+            param_maps = []
+            for p in getattr(fitter, '_param_map', []):
+                p = dict(p)
+                p.setdefault('type', 'material')
+                param_maps.append(p)
+            for k, ds in enumerate(fitter.datasets):
+                label = f"数据集 {k + 1}（2b = {2 * ds['b'] * 1e6:.4g} μm）"
+                sensors.append(sensor_entry(label, ds['b'], ds['sensor_params'], [], {}))
+                datasets.append(self._report_dataset(
+                    label, ds['freqs'], ds['V3_exp'], ds['b'], model_layers,
+                    ds['sensor_params'], param_maps if include_pm20 else [], n_layers, V))
+        else:
+            param_maps = [dict(p) for p in getattr(fitter, '_param_map', [])]
+            label = getattr(self, '_loaded_data_filename', None) or "测量数据"
+            sensors.append(sensor_entry("数值", fitter.b, fitter.sensor_params,
+                                        spec.get('sensor', []), sigma_sensor))
+            datasets.append(self._report_dataset(
+                label, fitter.freqs, fitter.V3_exp, fitter.b, model_layers,
+                fitter.sensor_params, param_maps if include_pm20 else [], n_layers, V))
+
+        slope = None
+        last_slope = getattr(self, '_last_slope_result', None)
+        if info.get('include_slope') and last_slope:
+            slope = dict(last_slope)
+            gi = slope.get('layer_idx')
+            if gi is not None and 0 <= gi < len(layers_ctx):
+                Lg = layers_ctx[gi]
+                try:
+                    k_geo = float(np.sqrt(float(Lg['k_x']) * float(Lg['k_y'])))
+                    dev = (slope['k'] - k_geo) / k_geo * 100
+                    slope['compare_text'] = (
+                        f"对比：{film_report._layer_display_name(Lg, gi, len(layers_ctx))}"
+                        f"全模型结果 √(k_x·k_y) = {film_report.fmt_sci(k_geo)} W/(m·K)，"
+                        f"斜率法相对偏差 {dev:+.1f}%。")
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+
+        mode_text = "多线宽联合拟合" if is_joint else {
+            'material': "材料参数拟合", 'sensor': "传感器参数拟合", 'combined': "材料+传感器联合拟合",
+        }.get(getattr(fitter, 'fit_type', ''), self.fit_mode.currentText())
+        return {
+            'info': {**info, 'data_file': getattr(self, '_loaded_data_filename', None)},
+            'sensors': sensors,
+            'layers': layers_ctx,
+            'fit': {
+                'mode_text': mode_text,
+                'fit_mode_code': getattr(fitter, 'fit_mode', 'both'),
+                'cancelled': bool(getattr(self, '_last_fit_cancelled', False)),
+                'converged': getattr(fitter, 'converged', None),
+                'n_params': len(getattr(fitter, '_param_map', [])),
+                'uncertainty': unc,
+            },
+            'datasets': datasets,
+            'slope': slope,
+            'include_pm20': include_pm20,
+            'include_appendix': info.get('include_appendix', True),
+            'extra_images': ([(info['image_path'], '测量仪器')]
+                             if info.get('image_path') else []),
+        }
+
+    @staticmethod
+    def _report_dataset(label, freqs, V3_exp, b, model_layers, sensor_params, param_maps, n_layers, V):
+        freqs = np.asarray(freqs, dtype=float)
+        Z = calculate_analytical_Z(freqs, b, model_layers)
+        V3_fit = convert_Z_to_V3(Z, freqs, b, sensor_params)
+        pm20 = []
+        for p_map in param_maps:
+            V_plus = V._v3_with_param_scale(freqs, b, model_layers, sensor_params, p_map, 1.2)
+            V_minus = V._v3_with_param_scale(freqs, b, model_layers, sensor_params, p_map, 0.8)
+            if V_plus is None and V_minus is None:
+                continue
+            pm20.append({'label': V._param_map_label(p_map, n_layers=n_layers),
+                         'V3_plus': V_plus, 'V3_minus': V_minus})
+        return {'label': label, 'freqs': freqs, 'V3_exp': np.asarray(V3_exp, dtype=complex),
+                'V3_fit': V3_fit, 'pm20': pm20}
+
     def _build_experiment_v3(self, silent=False):
         """根据已加载数据、频率筛选、剔点与信号校正返回 (freqs, V3_exp)。失败返回 (None, None)。"""
         if self.fitting_data is None:
@@ -5844,12 +6667,14 @@ class FittingWidget(QWidget):
             layers = []
             for i in range(N):
                 layer = {}
-                for param in ['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']:
+                for param in ['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']:
                     input_widget = self.findChild(QLineEdit, f"layer_{i}_{param}")
                     if input_widget:
                         text = input_widget.text()
                         layer[param] = np.inf if text.lower() == 'inf' else float(text)
+                layer['isotropic'] = self._layer_is_iso_in_gui(i)
                 layers.append(layer)
+            layers = sync_layers_anisotropy(layers)
 
             mode = self.fit_mode.currentText()
             is_combined = mode == "材料+传感器联合拟合"
@@ -5982,16 +6807,16 @@ class FittingWidget(QWidget):
                 self.results_text.append("\n拟合的材料参数:")
                 for i, layer in enumerate(fitted_result['layers']):
                     self.results_text.append(f"\n第 {i + 1} 层:")
-                    for param, value in layer.items():
-                        self.results_text.append(f"  {param}: {value:.6e}")
+                    for line in _format_layer_result_lines(layer):
+                        self.results_text.append(line)
             else:
                 fitted_result = gui_layers
                 result_kind = 'material'
                 self.results_text.append("\n拟合的材料参数:")
                 for i, layer in enumerate(fitted_result):
                     self.results_text.append(f"\n第 {i + 1} 层:")
-                    for param, value in layer.items():
-                        self.results_text.append(f"  {param}: {value:.6e}")
+                    for line in _format_layer_result_lines(layer):
+                        self.results_text.append(line)
 
             self.update_results_table(fitted_result, result_kind)
             self._append_result_row("厚度约束", f"第{gui_upper + 1}层 H", H_upper)
@@ -6313,14 +7138,9 @@ class PenetrationAnalysisWidget(QWidget):
         layer_v = QVBoxLayout()
         self.layer_layout = QVBoxLayout()
         layer_v.addLayout(self.layer_layout)
-        layer_btn_row = QHBoxLayout()
-        add_btn = QPushButton("添加层")
-        add_btn.clicked.connect(lambda: self._add_layer_ui(len(self.layer_widgets)))
-        rem_btn = QPushButton("删除顶层")
-        rem_btn.clicked.connect(self._remove_top_layer)
-        layer_btn_row.addWidget(add_btn)
-        layer_btn_row.addWidget(rem_btn)
-        layer_v.addLayout(layer_btn_row)
+        hint = QLabel("每层：+↑ 上方插入，+↓ 下方插入，− 删除")
+        hint.setStyleSheet("color:#666; font-size:11px;")
+        layer_v.addWidget(hint)
         layer_group.setLayout(layer_v)
         left.addWidget(layer_group)
         self._add_layer_ui(0)
@@ -6394,8 +7214,47 @@ class PenetrationAnalysisWidget(QWidget):
             if k in sens:
                 inp.setText(f"{sens[k]:.6g}")
 
-    def _add_layer_ui(self, idx):
-        box = QGroupBox(f"第 {idx} 层" + (" (基底)" if False else ""))
+    def _add_layer_ui(self, idx=None):
+        if idx is None:
+            idx = len(self.layer_widgets)
+        idx = max(0, min(int(idx), len(self.layer_widgets)))
+        if len(self.layer_widgets) >= 10:
+            QMessageBox.warning(self, "提示", "材料层数最多为 10 层。")
+            return
+
+        box = QGroupBox(f"第 {idx} 层")
+        outer = QVBoxLayout(box)
+        hdr = QHBoxLayout()
+        hdr.addStretch()
+        btn_above = QPushButton('+↑')
+        btn_above.setFixedSize(28, 26)
+        btn_above.setToolTip("在该层上方插入新层")
+        btn_above.setStyleSheet(
+            "QPushButton { color: #4CAF50; font-weight: bold; font-size: 13px; "
+            "border: 1px solid #4CAF50; border-radius: 3px; padding: 0; }"
+            "QPushButton:hover { background-color: #E8F5E9; }"
+        )
+        btn_below = QPushButton('+↓')
+        btn_below.setFixedSize(28, 26)
+        btn_below.setToolTip("在该层下方插入新层")
+        btn_below.setStyleSheet(
+            "QPushButton { color: #4CAF50; font-weight: bold; font-size: 13px; "
+            "border: 1px solid #4CAF50; border-radius: 3px; padding: 0; }"
+            "QPushButton:hover { background-color: #E8F5E9; }"
+        )
+        btn_remove = QPushButton('−')
+        btn_remove.setFixedSize(28, 26)
+        btn_remove.setToolTip("删除该层")
+        btn_remove.setStyleSheet(
+            "QPushButton { color: #f44336; font-weight: bold; font-size: 16px; "
+            "border: 1px solid #f44336; border-radius: 3px; padding: 0; }"
+            "QPushButton:hover { background-color: #FFEBEE; }"
+        )
+        hdr.addWidget(btn_above)
+        hdr.addWidget(btn_below)
+        hdr.addWidget(btn_remove)
+        outer.addLayout(hdr)
+
         lay = QGridLayout()
         lay.setColumnStretch(1, 1)
         combo = QComboBox()
@@ -6403,13 +7262,13 @@ class PenetrationAnalysisWidget(QWidget):
         lay.addWidget(QLabel("材料:"), 0, 0)
         lay.addWidget(combo, 0, 1)
         inputs = {}
-        for i, p in enumerate(['k_y', 'rho', 'cap', 'H', 'psi', 'Rc']):
+        for i, p in enumerate(['k_y', 'k_x', 'rho', 'cap', 'H', 'Rc']):
             lay.addWidget(QLabel(p), i + 1, 0)
             inp = QLineEdit()
             inp.setMinimumWidth(0)
             inputs[p] = inp
             lay.addWidget(inp, i + 1, 1)
-        box.setLayout(lay)
+        outer.addLayout(lay)
 
         def on_mat(text, inps=inputs):
             mat = self.material_db.get_material(text)
@@ -6420,15 +7279,39 @@ class PenetrationAnalysisWidget(QWidget):
         combo.currentTextChanged.connect(on_mat)
         on_mat(combo.currentText())
 
-        self.layer_layout.addWidget(box)
-        self.layer_widgets.append({'box': box, 'combo': combo, 'inputs': inputs})
+        info = {'box': box, 'combo': combo, 'inputs': inputs}
+        self.layer_layout.insertWidget(idx, box)
+        self.layer_widgets.insert(idx, info)
+
+        btn_above.clicked.connect(lambda: self._pen_insert_relative(box, above=True))
+        btn_below.clicked.connect(lambda: self._pen_insert_relative(box, above=False))
+        btn_remove.clicked.connect(lambda: self._pen_remove_layer(box))
         self._refresh_layer_titles()
 
-    def _remove_top_layer(self):
+    def _pen_index_of(self, box):
+        for i, w in enumerate(self.layer_widgets):
+            if w.get('box') == box:
+                return i
+        return -1
+
+    def _pen_insert_relative(self, box, above=True):
+        idx = self._pen_index_of(box)
+        if idx < 0:
+            return
+        if len(self.layer_widgets) >= 10:
+            QMessageBox.warning(self, "提示", "材料层数最多为 10 层。")
+            return
+        self._add_layer_ui(idx if above else idx + 1)
+
+    def _pen_remove_layer(self, box):
         if len(self.layer_widgets) <= 1:
             QMessageBox.warning(self, "提示", "至少保留一层。")
             return
-        w = self.layer_widgets.pop(0)
+        idx = self._pen_index_of(box)
+        if idx < 0:
+            return
+        w = self.layer_widgets.pop(idx)
+        self.layer_layout.removeWidget(w['box'])
         w['box'].deleteLater()
         self._refresh_layer_titles()
 
@@ -6491,7 +7374,7 @@ class PenetrationAnalysisWidget(QWidget):
                     layer[p] = np.inf
                 else:
                     layer[p] = float(t)
-            layers.append(layer)
+            layers.append(sync_layer_anisotropy(layer))
         return layers
 
     def run_analysis(self):
@@ -6515,9 +7398,38 @@ class PenetrationAnalysisWidget(QWidget):
             sub = layers[-1]
             alpha_sub = sub['k_y'] / (sub['rho'] * sub['cap'])
             H_sub = sub['H']
+            k_sub_eff = float(np.sqrt(sub['k_x'] * sub['k_y']))
 
-            # 线热源：δ ≥ N·b → f ≤ f_max_line
-            delta_line = N * b
+            # 上层面内铺热使基底“看到”的热源变宽：
+            #   b_eff ≈ b + Σk_x,i·H_i / √(k_x,sub·k_y,sub) + √(Σk_x,i·H_i · Rc_int)
+            # 层的 Rc 位于该层上表面，故 layers[1:] 的 Rc 为样品内部界面，layers[0] 的 Rc 为加热线/样品界面
+            kxH_sum = 0.0
+            for layer in layers[:-1]:
+                H_i = layer['H']
+                if np.isfinite(H_i) and H_i > 0:
+                    kxH_sum += layer['k_x'] * H_i
+            rc_int = 0.0
+            for layer in layers[1:]:
+                rc_i = float(layer.get('Rc', 0.0) or 0.0)
+                if np.isfinite(rc_i) and rc_i > 0:
+                    rc_int += rc_i
+            spread_len = kxH_sum / k_sub_eff if k_sub_eff > 0 else 0.0
+            spread_rc = float(np.sqrt(kxH_sum * rc_int)) if (kxH_sum > 0 and rc_int > 0) else 0.0
+            b_eff = b + spread_len + spread_rc
+
+            # 界面热阻被基底热阻“淹没”：δ_sub ≥ √10·k_sub·Rc_int → f ≤ f_Rc/10
+            rc_len = k_sub_eff * rc_int
+            if rc_len > 0:
+                f_Rc = freq_from_penetration_depth(alpha_sub, rc_len)
+                f_max_rc = f_Rc / 10.0
+            else:
+                f_Rc = np.inf
+                f_max_rc = np.inf
+
+            # 线热源：δ ≥ N·b_eff → f ≤ f_max_line
+            delta_line_b = N * b
+            f_max_line_b = freq_from_penetration_depth(alpha_sub, delta_line_b)
+            delta_line = N * b_eff
             f_max_line = freq_from_penetration_depth(alpha_sub, delta_line)
 
             # 半无限：δ ≤ H_sub/M → f ≥ f_min_semi
@@ -6528,12 +7440,7 @@ class PenetrationAnalysisWidget(QWidget):
                 delta_semi = np.inf
                 f_min_semi = 0.0
 
-            # 建议窗口
-            f_rec_min = f_min_semi
-            f_rec_max = f_max_line
-            window_ok = np.isfinite(f_rec_max) and (f_rec_min < f_rec_max)
-
-            # 各薄膜层特征频率（δ = H）
+            # 各上层特征频率（δ = H）与过渡带 f_H/10 ~ 10·f_H（对应 δ 从 √10·H 到 H/√10）
             film_info = []
             for i, layer in enumerate(layers[:-1]):
                 alpha_i = layer['k_y'] / (layer['rho'] * layer['cap'])
@@ -6542,21 +7449,44 @@ class PenetrationAnalysisWidget(QWidget):
                     f_H = freq_from_penetration_depth(alpha_i, H_i)
                     film_info.append({
                         'idx': i, 'alpha': alpha_i, 'H': H_i, 'f_H': f_H,
-                        'k_y': layer['k_y'],
+                        'f_tr_lo': f_H / 10.0, 'f_tr_hi': f_H * 10.0,
+                        'k_y': layer['k_y'], 'k_x': layer['k_x'],
                     })
+
+            # 上层全部被穿透：f ≤ min(f_H,i)/10
+            if film_info:
+                pen_idx = min(film_info, key=lambda fi: fi['f_tr_lo'])['idx']
+                f_max_pen = min(fi['f_tr_lo'] for fi in film_info)
+            else:
+                pen_idx = None
+                f_max_pen = np.inf
+
+            # 建议窗口
+            f_rec_min = f_min_semi
+            f_rec_max = min(f_max_line, f_max_pen, f_max_rc)
+            window_ok = bool(np.isfinite(f_rec_max) and (f_rec_min < f_rec_max))
+            if f_rec_max == f_max_pen and f_max_pen < f_max_line:
+                upper_limit_by = f"上层 {pen_idx} 未被穿透"
+            elif f_rec_max == f_max_rc and f_max_rc < f_max_line:
+                upper_limit_by = "界面热阻（δ_sub 需 ≫ k_sub·Rc）"
+            elif (spread_len + spread_rc) > 0.1 * b:
+                upper_limit_by = "线热源（按等效宽度 b_eff）"
+            else:
+                upper_limit_by = "线热源"
 
             # 评估当前扫频两端
             def judge_freq(f):
                 delta = float(thermal_penetration_depth(alpha_sub, f))
                 line_ok = delta >= delta_line
+                pen_ok = (f <= f_max_pen) and (f <= f_max_rc)
                 if np.isfinite(H_sub) and H_sub > 0:
                     semi_ok = delta <= delta_semi
                 else:
                     semi_ok = True  # 半无限基底无下界约束
-                return delta, line_ok, semi_ok
+                return delta, line_ok, semi_ok, pen_ok
 
-            d_lo, line_lo, semi_lo = judge_freq(f_lo)
-            d_hi, line_hi, semi_hi = judge_freq(f_hi)
+            d_lo, line_lo, semi_lo, pen_lo = judge_freq(f_lo)
+            d_hi, line_hi, semi_hi, pen_hi = judge_freq(f_hi)
 
             # 在区间内均匀抽若干点检查是否都落在建议窗
             probe = np.logspace(np.log10(f_lo), np.log10(f_hi), 21)
@@ -6571,11 +7501,14 @@ class PenetrationAnalysisWidget(QWidget):
                 'alpha_sub': alpha_sub, 'b': b, 'H_sub': H_sub,
                 'N': N, 'M': M, 'delta_line': delta_line, 'delta_semi': delta_semi,
                 'f_max_line': f_max_line, 'f_min_semi': f_min_semi,
+                'f_max_line_b': f_max_line_b, 'b_eff': b_eff, 'spread_len': spread_len,
+                'f_max_pen': f_max_pen, 'rc_int': rc_int, 'spread_rc': spread_rc,
+                'f_Rc': f_Rc, 'f_max_rc': f_max_rc,
                 'f_rec_min': f_rec_min, 'f_rec_max': f_rec_max,
                 'window_ok': window_ok, 'film_info': film_info,
                 'f_lo': f_lo, 'f_hi': f_hi,
             }
-            self.apply_lockin_btn.setEnabled(window_ok and np.isfinite(f_rec_max))
+            self.apply_lockin_btn.setEnabled(bool(window_ok and np.isfinite(f_rec_max)))
 
             # ---- 文本报告 ----
             lines = []
@@ -6586,8 +7519,15 @@ class PenetrationAnalysisWidget(QWidget):
             lines.append("【公式】")
             lines.append("  α = k_y / (ρ · c)")
             lines.append("  δ(f) = √(α / (4π f))   （电频率 f，热波频率 2ω）")
-            lines.append(f"  线热源近似: δ ≥ {N:g}·b  →  f ≤ α / (4π ({N:g}b)²)")
+            lines.append(f"  线热源近似: δ ≥ {N:g}·b_eff  →  f ≤ α / (4π ({N:g}·b_eff)²)")
+            lines.append("    b_eff ≈ b + Σk_x,i·H_i/√(k_x,sub·k_y,sub) + √(Σk_x,i·H_i·Rc_int)")
+            lines.append("    （上层面内铺热、界面热阻阻挡后的横向铺开，都会使热源变宽）")
             lines.append(f"  半无限基底: δ ≤ H_sub/{M:g} →  f ≥ α / (4π (H_sub/{M:g})²)")
+            if film_info:
+                lines.append("  上层已穿透: 每个上层 f ≤ f_H,i / 10，f_H,i = α_i / (4π H_i²)")
+            if rc_int > 0:
+                lines.append("  界面热阻被淹没: δ_sub ≥ √10·k_sub·Rc_int → f ≤ f_Rc/10，"
+                             "f_Rc = α_sub / (4π (k_sub·Rc_int)²)")
             lines.append("")
             lines.append("【基底 / 传感器】")
             lines.append(f"  半线宽 b = {b * 1e6:.4g} μm")
@@ -6596,44 +7536,72 @@ class PenetrationAnalysisWidget(QWidget):
                 lines.append(f"  基底厚度 H_sub = {H_sub * 1e6:.4g} μm")
             else:
                 lines.append("  基底厚度 H_sub = ∞ （半无限，无下界频率约束）")
-            lines.append(f"  线热源临界穿透 δ_line = {N:g}·b = {delta_line * 1e6:.4g} μm")
+            if film_info:
+                lines.append(f"  上层铺热长度 ℓ ≈ {spread_len * 1e6:.4g} μm")
+                if rc_int > 0:
+                    lines.append(f"  内部界面热阻合计 Rc_int = {rc_int:.3g} K·m²/W"
+                                 f"  →  界面铺热长度 ℓ_Rc ≈ {spread_rc * 1e6:.4g} μm")
+                    lines.append(f"    等效基底厚度 k_sub·Rc_int ≈ {rc_len * 1e6:.4g} μm"
+                                 f"，f_Rc ≈ {f_Rc:.4g} Hz")
+                lines.append(f"  等效半宽 b_eff ≈ {b_eff * 1e6:.4g} μm")
+                if spread_len + spread_rc > b:
+                    lines.append("    ⚠️ b_eff 明显大于 b：铺热显著，基底线性区被推向更低频")
+            if layers[0].get('Rc', 0) and np.isfinite(layers[0].get('Rc', 0)) and layers[0]['Rc'] > 0:
+                lines.append(f"  加热线/样品界面 Rc = {layers[0]['Rc']:.3g} K·m²/W：只整体平移，不影响线性区与斜率")
+            lines.append(f"  线热源临界穿透 δ_line = {N:g}·b_eff = {delta_line * 1e6:.4g} μm")
             if np.isfinite(delta_semi):
                 lines.append(f"  半无限临界穿透 δ_semi = H/{M:g} = {delta_semi * 1e6:.4g} μm")
             lines.append("")
-            lines.append("【建议频率窗口（基于基底 α）】")
+            lines.append("【基底线性区建议窗口】")
             if window_ok:
                 lines.append(f"  ✅ 建议范围: {f_rec_min:.4g} Hz  ≤  f  ≤  {f_rec_max:.4g} Hz")
                 lines.append(f"     (约 {f_rec_min:.3e} ~ {f_rec_max:.3e} Hz)")
+                lines.append(f"     上限由「{upper_limit_by}」决定")
             else:
-                lines.append("  ❌ 不存在同时满足两判据的频率窗口")
+                lines.append("  ❌ 不存在同时满足各判据的频率窗口")
                 lines.append(f"     半无限下界 f_min = {f_min_semi:.4g} Hz")
-                lines.append(f"     线热源上界 f_max = {f_max_line:.4g} Hz")
+                lines.append(f"     线热源上界 f_max = {f_max_line:.4g} Hz（按 b_eff）")
+                if np.isfinite(f_max_pen):
+                    lines.append(f"     上层穿透上界 f_max = {f_max_pen:.4g} Hz")
+                if np.isfinite(f_max_rc):
+                    lines.append(f"     界面热阻上界 f_max = {f_max_rc:.4g} Hz")
                 if np.isfinite(H_sub) and H_sub > 0:
-                    lines.append(f"     H_sub/b = {H_sub / b:.3g}；若过小则斜率法难同时满足两条件")
+                    lines.append(f"     H_sub/b_eff = {H_sub / b_eff:.3g}；若过小则基底无独立线性区")
                 lines.append("     建议：加宽加热线、加厚基底，或改用全模型拟合（本软件多层模型）")
+            if film_info and np.isfinite(f_max_line_b) and abs(f_max_line_b - f_rec_max) > 0.05 * f_max_line_b:
+                lines.append(f"     （若只按 δ ≥ {N:g}·b、不考虑上层，上限会是 {f_max_line_b:.4g} Hz，偏乐观）")
+            lines.append("  线性区斜率对应基底 √(k_x·k_y)（各向同性时即 k）；界面热阻只影响截距（整体平移）")
             lines.append("")
 
             if film_info:
-                lines.append("【薄膜特征频率】δ = H 时 f = α/(4π H²)")
+                lines.append("【上层界面过渡带】δ = H 时 f_H = α/(4π H²)；过渡带 ≈ f_H/10 ~ 10·f_H")
                 for fi in film_info:
                     lines.append(
                         f"  层{fi['idx']}: H={fi['H']*1e6:.4g} μm, α={fi['alpha']:.3e} m²/s"
-                        f"  →  f_H ≈ {fi['f_H']:.4g} Hz"
+                        f"  →  f_H ≈ {fi['f_H']:.4g} Hz，过渡带 ≈ {fi['f_tr_lo']:.3g} ~ {fi['f_tr_hi']:.3g} Hz"
                     )
-                lines.append("  （扫频宜覆盖各层 f_H 附近，薄膜信息才更敏感）")
+                    if fi['f_tr_lo'] > f_hi:
+                        lines.append("      （整个扫频都低于过渡带：该层已被穿透，只表现为薄层偏移/铺热）")
+                    elif fi['f_tr_hi'] < f_lo:
+                        lines.append("      （整个扫频都高于过渡带：热波未到达该层底面）")
+                lines.append("  （扫频宜覆盖各层 f_H 附近，薄膜信息才更敏感；界面热阻不改变过渡带位置）")
                 lines.append("")
 
             lines.append("【当前扫频评估】")
             lines.append(f"  设定范围: {f_lo:.4g} ~ {f_hi:.4g} Hz")
             lines.append(f"  @ f_min={f_lo:.4g} Hz:  δ={d_lo*1e6:.4g} μm")
+            pen_label = "上层穿透/界面热阻" if rc_int > 0 else "上层穿透"
+            pen_txt = lambda ok: '' if not film_info else (
+                f"   {pen_label}: {'✅ OK' if ok else '❌ 频率过高(上层未穿透或界面热阻未淹没)'}")
             lines.append(f"      线热源: {'✅ OK' if line_lo else '❌ 偏高频(δ过小)'}"
-                         f"   半无限: {'✅ OK' if semi_lo else '❌ 偏低频(δ过大)'}")
+                         f"   半无限: {'✅ OK' if semi_lo else '❌ 偏低频(δ过大)'}" + pen_txt(pen_lo))
             lines.append(f"  @ f_max={f_hi:.4g} Hz:  δ={d_hi*1e6:.4g} μm")
             lines.append(f"      线热源: {'✅ OK' if line_hi else '❌ 偏高频(δ过小)'}"
-                         f"   半无限: {'✅ OK' if semi_hi else '❌ 偏低频(δ过大)'}")
+                         f"   半无限: {'✅ OK' if semi_hi else '❌ 偏低频(δ过大)'}" + pen_txt(pen_hi))
             lines.append(f"  区间内落在建议窗的比例: {frac_ok*100:.0f}%")
 
-            overall = line_lo and line_hi and semi_lo and semi_hi and (frac_ok >= 0.9)
+            overall = (line_lo and line_hi and semi_lo and semi_hi and pen_lo and pen_hi
+                       and (frac_ok >= 0.9))
             lines.append("")
             if overall and window_ok:
                 lines.append("【总评】✅ 当前频率范围整体合适。")
@@ -6652,10 +7620,12 @@ class PenetrationAnalysisWidget(QWidget):
             lines.append("")
             lines.append("注: 上述判据针对「斜率法 / 线热源 + 半无限基底」近似；")
             lines.append("    本软件 Olson 多层模型可在更宽频段工作，但仍建议 δ 与结构尺度可比。")
+            lines.append("    ℓ、过渡带均为数量级估算（可能差几倍）。")
 
             self.report.setPlainText("\n".join(lines))
             self._plot_analysis(alpha_sub, b, H_sub, N, M, f_lo, f_hi,
-                                f_rec_min, f_rec_max, window_ok, film_info)
+                                f_rec_min, f_rec_max, window_ok, film_info, b_eff=b_eff,
+                                rc_len=rc_len)
 
         except Exception as e:
             self.report.setPlainText(f"分析失败:\n{e}")
@@ -6663,7 +7633,7 @@ class PenetrationAnalysisWidget(QWidget):
             QMessageBox.warning(self, "分析失败", str(e))
 
     def _plot_analysis(self, alpha_sub, b, H_sub, N, M, f_lo, f_hi,
-                       f_rec_min, f_rec_max, window_ok, film_info):
+                       f_rec_min, f_rec_max, window_ok, film_info, b_eff=None, rc_len=0.0):
         # 确保中文字体仍生效（其它模块可能改过 rcParams）
         _configure_matplotlib_chinese_font()
 
@@ -6682,6 +7652,12 @@ class PenetrationAnalysisWidget(QWidget):
         # 判据水平线
         ax.axhline(N * b * 1e6, color='#ff7f0e', ls='--', lw=1.5,
                    label=f'Line source: {N:g}·b = {N*b*1e6:.3g} μm')
+        if b_eff is not None and b_eff > 1.1 * b:
+            ax.axhline(N * b_eff * 1e6, color='#d62728', ls='--', lw=1.5,
+                       label=f'Line source: {N:g}·b_eff = {N*b_eff*1e6:.3g} μm')
+        if rc_len and rc_len > 0:
+            ax.axhline(np.sqrt(10.0) * rc_len * 1e6, color='#8c564b', ls='-.', lw=1.5,
+                       label=f'Rc buried: √10·k_sub·Rc = {np.sqrt(10.0)*rc_len*1e6:.3g} μm')
         if np.isfinite(H_sub) and H_sub > 0:
             ax.axhline(H_sub / M * 1e6, color='#2ca02c', ls='--', lw=1.5,
                        label=f'Semi-inf: H/{M:g} = {H_sub/M*1e6:.3g} μm')
@@ -6696,9 +7672,14 @@ class PenetrationAnalysisWidget(QWidget):
         ax.axvspan(f_lo, f_hi, color='#2196F3', alpha=0.12, label='Current sweep')
 
         # 薄膜 H 标记
-        for fi in film_info:
+        for j, fi in enumerate(film_info):
             ax.axhline(fi['H'] * 1e6, color='#9467bd', ls=':', alpha=0.5)
             if np.isfinite(fi['f_H']) and fi['f_H'] > 0:
+                span_lo = max(fi['f_tr_lo'], f_plot_min)
+                span_hi = min(fi['f_tr_hi'], f_plot_max)
+                if span_lo < span_hi:
+                    ax.axvspan(span_lo, span_hi, color='#9467bd', alpha=0.08,
+                               label='Interface transition (f_H/10~10f_H)' if j == 0 else None)
                 ax.axvline(fi['f_H'], color='#9467bd', ls=':', alpha=0.5)
                 ax.plot([fi['f_H']], [fi['H'] * 1e6], 'D', color='#9467bd',
                         label=f"Layer{fi['idx']} δ=H")
@@ -7567,6 +8548,7 @@ class ThermalMeasurementGUI(QMainWindow):
         self.simulation_widget.set_fitting_source(self.fitting_widget)
         self.sensitivity_widget.set_fitting_source(self.fitting_widget)
         self.penetration_widget.set_fitting_source(self.fitting_widget)
+        self.fitting_widget._penetration_source = self.penetration_widget
         self.penetration_widget._apply_freq_callback = self._apply_recommended_freqs
         self.fitting_widget.set_lockin_source(self.lockin_widget)
         self.lockin_widget.set_fitting_source(self.fitting_widget)

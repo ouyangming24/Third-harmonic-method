@@ -6,6 +6,79 @@ class FitCancelledError(Exception):
     """用户主动中止拟合时抛出。"""
 
 
+def layer_is_isotropic(layer):
+    """层是否标记为各向同性（k_x 始终等于 k_y）。"""
+    v = layer.get('isotropic', False)
+    if isinstance(v, str):
+        return v.strip().lower() in ('1', 'true', 'yes', 'y', '是')
+    try:
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return False
+    except TypeError:
+        pass
+    return bool(v)
+
+
+def sync_layer_anisotropy(layer):
+    """统一层内 k_y / k_x / psi。
+
+    约定 ψ = k_x / k_y。各向同性层强制 k_x = k_y；否则优先使用 k_x（面内），
+    若仅有旧字段 psi 则反推 k_x。就地修改并返回同一 dict。
+    """
+    if layer is None or 'k_y' not in layer:
+        raise KeyError("layer 缺少 k_y")
+    ky = float(layer['k_y'])
+    if layer_is_isotropic(layer):
+        layer['k_x'] = ky
+        layer['psi'] = 1.0
+        return layer
+    has_kx = layer.get('k_x', None) is not None and str(layer.get('k_x')).strip() != ''
+    has_psi = layer.get('psi', None) is not None and str(layer.get('psi')).strip() != ''
+
+    if has_kx:
+        kx = float(layer['k_x'])
+        layer['k_x'] = kx
+        layer['psi'] = (kx / ky) if (np.isfinite(ky) and ky != 0) else float(layer.get('psi', 1.0) or 1.0)
+    elif has_psi:
+        psi = float(layer['psi'])
+        layer['psi'] = psi
+        layer['k_x'] = psi * ky if np.isfinite(ky) else psi
+    else:
+        layer['k_x'] = ky if np.isfinite(ky) else 1.0
+        layer['psi'] = 1.0
+    return layer
+
+
+def sync_layers_anisotropy(layers):
+    """复制并同步各层各向异性字段。"""
+    return [sync_layer_anisotropy(dict(l)) for l in layers]
+
+
+def _resync_layer_after_param_update(layer, updated_props):
+    """拟合向量写回后同步各向异性。
+
+    - 若本步更新了 psi 且未更新 k_x：以 psi 为准 → k_x = psi * k_y
+    - 否则以 k_x 为准 → psi = k_x / k_y（固定面内、拟合面外时走这条）
+    """
+    updated_props = set(updated_props or [])
+    ky = float(layer['k_y'])
+    if layer_is_isotropic(layer):
+        layer['k_x'] = ky
+        layer['psi'] = 1.0
+        return layer
+    if 'psi' in updated_props and 'k_x' not in updated_props:
+        psi = float(layer.get('psi', 1.0))
+        layer['psi'] = psi
+        layer['k_x'] = psi * ky if np.isfinite(ky) else psi
+    else:
+        if layer.get('k_x', None) is None or str(layer.get('k_x')).strip() == '':
+            layer['k_x'] = float(layer.get('psi', 1.0)) * ky if np.isfinite(ky) else 1.0
+        kx = float(layer['k_x'])
+        layer['k_x'] = kx
+        layer['psi'] = (kx / ky) if (np.isfinite(ky) and ky != 0) else 1.0
+    return layer
+
+
 def _build_fisher_matrix_A(D_complex, V3_tilde, V3_exp, fit_mode):
     """由灵敏度矩阵构建 Fisher 信息矩阵 A ≈ J^T J（与拟合迭代中一致）。"""
     if fit_mode == 'both':
@@ -204,23 +277,118 @@ def _calculate_transform_impedance(chi, f, b, layers):
     return z_tilde_prev
 
 
-def calculate_analytical_Z(freqs, b, layers):
+# Gauss–Legendre 节点缓存：积分区间 [0, 4π]
+_GL_CACHE = {}
+
+# 低频时被积函数在 χ→0 处有宽度约 qb 的尖峰（qb 可低至 1e-5），
+# 因此用对数分段把节点向 0 加密，而不是在 [0, 4π] 上均匀布置
+_GL_PANEL_DECADES = 8
+_GL_PANELS_PER_DECADE = 3
+
+
+def _gauss_legendre_0_to_4pi(n):
+    """返回 (chi, weights, sinc²)，用于 Olson χ 积分；n 为每个分段的节点数。"""
+    n = int(n)
+    cached = _GL_CACHE.get(n)
+    if cached is not None:
+        return cached
+    from scipy.special import roots_legendre
+    x, w = roots_legendre(n)
+    top = 4.0 * np.pi
+    edges = np.concatenate((
+        [0.0],
+        top * np.logspace(-_GL_PANEL_DECADES, 0,
+                          _GL_PANEL_DECADES * _GL_PANELS_PER_DECADE + 1),
+    ))
+    chi_parts, w_parts = [], []
+    for a, bb in zip(edges[:-1], edges[1:]):
+        chi_parts.append(0.5 * (bb - a) * x + 0.5 * (a + bb))
+        w_parts.append(0.5 * (bb - a) * w)
+    chi = np.concatenate(chi_parts)
+    ww = np.concatenate(w_parts)
+    sinc = np.ones_like(chi)
+    mask = np.abs(chi) > 0
+    sinc[mask] = (np.sin(chi[mask]) / chi[mask]) ** 2
+    _GL_CACHE[n] = (chi, ww, sinc)
+    return _GL_CACHE[n]
+
+
+def _transform_impedance_grid(chi, freqs, b, layers):
+    """向量化计算 z(χ,f)，形状 (n_freq, n_chi)。"""
+    chi = np.asarray(chi, dtype=float)
+    freqs = np.asarray(freqs, dtype=float)
+    f = freqs[:, None]
+    c2 = chi[None, :] ** 2
+
+    props_1 = layers[0]
+    k_y1 = float(props_1['k_y'])
+    alpha_y1 = k_y1 / (float(props_1.get('rho', 2200)) * float(props_1.get('cap', 800)))
+    psi_1 = float(props_1.get('psi', 1.0))
+    phi_1 = np.sqrt(psi_1 * c2 + 1j * (4.0 * np.pi * b * b / alpha_y1) * f)
+    z_tilde = -b / (k_y1 * phi_1) - float(props_1.get('Rc', 0.0))
+
+    for n in range(1, len(layers)):
+        lp = layers[n]
+        k_yn = float(lp['k_y'])
+        alpha_yn = k_yn / (float(lp.get('rho', 2000)) * float(lp.get('cap', 1000)))
+        psi_n = float(lp.get('psi', 1.0))
+        H_n = float(lp['H'])
+        phi_n = np.sqrt(psi_n * c2 + 1j * (4.0 * np.pi * b * b / alpha_yn) * f)
+        with np.errstate(over='ignore'):
+            tanh_term = np.tanh(phi_n * (H_n / b))
+        denom_term = (k_yn * phi_n / b) * z_tilde * tanh_term
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            numerator = denom_term / tanh_term - tanh_term
+            denominator = 1.0 - denom_term
+            z_n = (b / (k_yn * phi_n)) * (numerator / denominator)
+        bad = (
+            (np.abs(denominator) < 1e-30)
+            | (np.abs(phi_n) < 1e-30)
+            | (np.abs(tanh_term) < 1e-30)
+            | (~np.isfinite(z_n.real))
+            | (~np.isfinite(z_n.imag))
+        )
+        if np.any(bad):
+            z_n = np.array(z_n, copy=True)
+            z_n[bad] = 0.0
+        z_tilde = z_n - float(lp.get('Rc', 0.0))
+
+    return z_tilde
+
+
+def calculate_analytical_Z(freqs, b, layers, n_quad=12, method='gl'):
+    """计算表面阻抗 Z̃(f)。
+
+    默认用对数分段 Gauss–Legendre（n_quad 为每段节点数）+ 全频率向量化，
+    显著快于逐频点 adaptive quad。
+    method='quad' 可回退到原先的 scipy.integrate.quad（更慢、极严容差）。
     """
-    Calculates the analytical surface impedance Z_tilde for a range of frequencies.
-    """
-    Z_analytical = np.zeros(len(freqs), dtype=complex)
-    for i, f in enumerate(freqs):
-        def integrand(chi):
-            sinc_term = (np.sin(chi) / chi) ** 2 if chi != 0 else 1.0
-            z_transform = _calculate_transform_impedance(chi, f, b, layers)
-            return sinc_term * z_transform
+    layers = sync_layers_anisotropy(layers)
+    freqs = np.asarray(freqs, dtype=float).ravel()
+    if freqs.size == 0:
+        return np.zeros(0, dtype=complex)
 
-        integral_real, _ = integrate.quad(lambda chi: integrand(chi).real, 0, 4 * np.pi, epsabs=1e-12, epsrel=1e-12, limit=100)
-        integral_imag, _ = integrate.quad(lambda chi: integrand(chi).imag, 0, 4 * np.pi, epsabs=1e-12, epsrel=1e-12, limit=100)
+    if method == 'quad':
+        Z_analytical = np.zeros(len(freqs), dtype=complex)
+        for i, f in enumerate(freqs):
+            def integrand(chi):
+                sinc_term = (np.sin(chi) / chi) ** 2 if chi != 0 else 1.0
+                z_transform = _calculate_transform_impedance(chi, f, b, layers)
+                return sinc_term * z_transform
 
-        Z_analytical[i] = (2 / np.pi) * (integral_real + 1j * integral_imag)
-    return Z_analytical
+            integral_real, _ = integrate.quad(
+                lambda chi: integrand(chi).real, 0, 4 * np.pi,
+                epsabs=1e-12, epsrel=1e-12, limit=100)
+            integral_imag, _ = integrate.quad(
+                lambda chi: integrand(chi).imag, 0, 4 * np.pi,
+                epsabs=1e-12, epsrel=1e-12, limit=100)
+            Z_analytical[i] = (2 / np.pi) * (integral_real + 1j * integral_imag)
+        return Z_analytical
 
+    chi, ww, sinc = _gauss_legendre_0_to_4pi(n_quad)
+    z_grid = _transform_impedance_grid(chi, freqs, b, layers)
+    z_grid = np.where(np.isfinite(z_grid), z_grid, 0.0)
+    return (2.0 / np.pi) * np.sum(ww[None, :] * (sinc[None, :] * z_grid), axis=1)
 
 def calculate_experimental_Z(V3_rms, R, b, L, V_rms, dR_dT):
     """
@@ -253,7 +421,8 @@ class ThermalModelFitter:
             sensor_params (dict): Dictionary of sensor properties ('R', 'L', 'V_rms', 'dR_dT', 'H_e', 'rho_C_e').
             initial_layers (list): List of dictionaries for initial layer properties.
             params_to_fit (dict): Dictionary specifying which parameters to fit.
-                                 For material: {'layer_0': ['k_y', 'Rc'], ...}
+                                 For material: {'layer_0': ['k_y', 'k_x', 'Rc'], ...}
+                                 （推荐拟合 k_y/k_x；旧 psi 仍可用，内部会同步）
                                  For sensor: {'sensor': ['R', 'dR_dT', 'V_rms'], ...}
             fit_mode (str): Fitting mode. Can be 'both', 'real', 'imag', 'amp', or 'phase'.
             param_bounds (dict): Dictionary of parameter bounds.
@@ -270,7 +439,7 @@ class ThermalModelFitter:
         self.V3_exp = V3_exp
         self.b = b
         self.sensor_params = sensor_params.copy()  # Make a copy to allow modification
-        self.layers = [l.copy() for l in initial_layers]  # Use a copy to avoid side effects
+        self.layers = sync_layers_anisotropy(initial_layers)  # k_y/k_x/ψ 对齐
         self.params_to_fit = params_to_fit
         self.param_bounds = param_bounds or {}
         self.fit_type = fit_type  # 'material' or 'sensor'
@@ -431,6 +600,12 @@ class ThermalModelFitter:
                     elif prop == 'k_y':
                         lower_bounds.append(0.001)
                         upper_bounds.append(5000)
+                    elif prop == 'k_x':
+                        lower_bounds.append(0.001)
+                        upper_bounds.append(5000)
+                    elif prop == 'psi':  # 旧参数，仍兼容
+                        lower_bounds.append(0.01)
+                        upper_bounds.append(100)
                     elif prop == 'rho':  # 密度边界
                         lower_bounds.append(100)  # 最小 100 kg/m³
                         upper_bounds.append(20000)  # 最大 20000 kg/m³
@@ -467,6 +642,7 @@ class ThermalModelFitter:
         return vec
 
     def _update_layers_from_vector(self, param_vector):
+        updated_props_by_layer = {}
         for i, p_map in enumerate(self._param_map):
             if p_map['type'] == 'sensor':
                 self.sensor_params[p_map['prop']] = param_vector[i]
@@ -476,7 +652,12 @@ class ThermalModelFitter:
                 self.layers[p_map['upper_idx']]['H'] = h_up
                 self.layers[p_map['lower_idx']]['H'] = p_map['H_total'] - h_up
             else:
-                self.layers[p_map['layer_idx']][p_map['prop']] = param_vector[i]
+                idx = p_map['layer_idx']
+                prop = p_map['prop']
+                self.layers[idx][prop] = param_vector[i]
+                updated_props_by_layer.setdefault(idx, set()).add(prop)
+        for idx, props in updated_props_by_layer.items():
+            _resync_layer_after_param_update(self.layers[idx], props)
 
     def _convert_Z_to_V3(self, Z_corrected):
         """Converts theoretical Z* to theoretical V3_rms."""
@@ -689,8 +870,10 @@ class ThermalModelFitter:
 
             if epsilon < tol:
                 print(f"在 {j + 1} 次迭代后收敛。")
+                self.converged = True
                 break
         else:
+            self.converged = False
             print("警告: 已达到最大迭代次数但未收敛。")
 
         # 输出拟合结果（详细层参数由 GUI 汇总展示，此处避免重复打印）
@@ -771,12 +954,12 @@ class JointThermalModelFitter:
                 'b': heater half-width (m)
                 'sensor_params': dict with R, L, V_rms, dR_dT, H_e, rho_C_e
             initial_layers: list of layer property dicts (shared)
-            params_to_fit: dict, e.g. {'layer_0': ['k_y', 'psi'], 'layer_1': ['k_y']}
+            params_to_fit: dict, e.g. {'layer_0': ['k_y', 'k_x'], 'layer_1': ['k_y']}
             fit_mode: 'both', 'real', 'imag', 'amp', 'phase'
             param_bounds: dict of bounds per layer/param
         """
         self.datasets = datasets
-        self.layers = [l.copy() for l in initial_layers]
+        self.layers = sync_layers_anisotropy(initial_layers)
         self.params_to_fit = params_to_fit
         self.param_bounds = param_bounds or {}
         self.fit_mode = fit_mode
@@ -812,6 +995,9 @@ class JointThermalModelFitter:
                 elif prop == 'k_y':
                     lower_bounds.append(0.001)
                     upper_bounds.append(5000)
+                elif prop == 'k_x':
+                    lower_bounds.append(0.001)
+                    upper_bounds.append(5000)
                 elif prop == 'rho':
                     lower_bounds.append(100)
                     upper_bounds.append(20000)
@@ -840,8 +1026,14 @@ class JointThermalModelFitter:
         return vec
 
     def _update_layers_from_vector(self, param_vector):
+        updated_props_by_layer = {}
         for i, p_map in enumerate(self._param_map):
-            self.layers[p_map['layer_idx']][p_map['prop']] = param_vector[i]
+            idx = p_map['layer_idx']
+            prop = p_map['prop']
+            self.layers[idx][prop] = param_vector[i]
+            updated_props_by_layer.setdefault(idx, set()).add(prop)
+        for idx, props in updated_props_by_layer.items():
+            _resync_layer_after_param_update(self.layers[idx], props)
 
     def _compute_sensitivity_for_dataset(self, freqs, b, sensor_params):
         """Compute D matrix (material sensitivity) for one dataset."""
@@ -954,8 +1146,10 @@ class JointThermalModelFitter:
 
             if epsilon < tol:
                 print(f"在 {j + 1} 次迭代后收敛。")
+                self.converged = True
                 break
         else:
+            self.converged = False
             print("警告: 已达到最大迭代次数但未收敛。")
 
         # 详细层参数由 GUI 汇总展示，避免与结果区重复

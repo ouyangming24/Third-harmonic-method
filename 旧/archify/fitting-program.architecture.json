@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "3ω 热物性测量与拟合程序",
+    "output": "fitting-program.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "measure-path",
+        "label": "测量主路径",
+        "focus": ["operator", "main-gui", "lockin-ctrl", "lockin-hw", "data-files"],
+        "note": "从主窗口进入锁相控制，驱动仪器扫频并写出 V3(f) 数据。"
+      },
+      {
+        "id": "fit-path",
+        "label": "拟合与分析",
+        "focus": ["main-gui", "fitting", "olson", "analysis", "data-files"],
+        "note": "FittingWidget 读取实验数据，调用 Olson 模型正演与拟合，再同步到分析页。"
+      },
+      {
+        "id": "fiber-path",
+        "label": "纤维丝子系统",
+        "focus": ["operator", "fiber-gui", "fiber-models"],
+        "note": "独立入口 fiber_thermal_gui.py，导电丝 Lu 模型与绝缘镀层模型可切换。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "操作者",
+      "sublabel": "实验 / 拟合",
+      "pos": [48, 248],
+      "size": [128, 64]
+    },
+    {
+      "id": "main-gui",
+      "type": "frontend",
+      "label": "ThermalMeasurementGUI",
+      "sublabel": "thermal_measurement_gui2.py",
+      "tag": "PyQt5 主窗口",
+      "pos": [248, 240],
+      "size": [188, 80]
+    },
+    {
+      "id": "lockin-ctrl",
+      "type": "backend",
+      "label": "LockInControlWidget",
+      "sublabel": "苏黎世 / OE1300 + 调平",
+      "pos": [508, 88],
+      "size": [188, 72]
+    },
+    {
+      "id": "lockin-hw",
+      "type": "external",
+      "label": "锁相放大器",
+      "sublabel": "Zurich / OE1300",
+      "pos": [768, 92],
+      "size": [168, 64]
+    },
+    {
+      "id": "data-files",
+      "type": "database",
+      "label": "实验数据",
+      "sublabel": "Excel / CSV",
+      "pos": [1020, 92],
+      "size": [168, 64]
+    },
+    {
+      "id": "fitting",
+      "type": "backend",
+      "label": "FittingWidget",
+      "sublabel": "数据拟合页",
+      "pos": [508, 248],
+      "size": [188, 80]
+    },
+    {
+      "id": "olson",
+      "type": "backend",
+      "label": "Olson 多层模型",
+      "sublabel": "olson_model26_3.py",
+      "tag": "ThermalModelFitter",
+      "pos": [768, 248],
+      "size": [188, 80]
+    },
+    {
+      "id": "analysis",
+      "type": "frontend",
+      "label": "分析与可视化",
+      "sublabel": "模拟 / 灵敏度 / 穿透 / 图",
+      "pos": [768, 408],
+      "size": [188, 80]
+    },
+    {
+      "id": "fiber-gui",
+      "type": "frontend",
+      "label": "FiberThermalGUI",
+      "sublabel": "fiber_thermal_gui.py",
+      "pos": [248, 548],
+      "size": [188, 80]
+    },
+    {
+      "id": "fiber-models",
+      "type": "backend",
+      "label": "纤维丝模型",
+      "sublabel": "Lu 2001 / 绝缘镀层",
+      "pos": [508, 548],
+      "size": [188, 80]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "薄膜 3ω 主程序",
+      "wraps": ["main-gui", "lockin-ctrl", "fitting"]
+    },
+    {
+      "kind": "region",
+      "label": "纤维丝独立程序",
+      "wraps": ["fiber-gui", "fiber-models"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "op-to-main",
+      "from": "operator",
+      "to": "main-gui",
+      "label": "启动主程序",
+      "variant": "emphasis"
+    },
+    {
+      "id": "main-to-lockin",
+      "from": "main-gui",
+      "to": "lockin-ctrl",
+      "label": "锁相控制页",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "id": "lockin-to-hw",
+      "from": "lockin-ctrl",
+      "to": "lockin-hw",
+      "label": "LabOne / SCPI"
+    },
+    {
+      "id": "hw-to-data",
+      "from": "lockin-hw",
+      "to": "data-files",
+      "label": "扫频写出",
+      "variant": "dashed"
+    },
+    {
+      "id": "main-to-fitting",
+      "from": "main-gui",
+      "to": "fitting",
+      "label": "数据拟合页"
+    },
+    {
+      "id": "fitting-to-olson",
+      "from": "fitting",
+      "to": "olson",
+      "label": "正演 / 拟合"
+    },
+    {
+      "id": "data-to-fitting",
+      "from": "data-files",
+      "to": "fitting",
+      "label": "读入 V3(f)",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [[1104, 528], [602, 528]]
+    },
+    {
+      "id": "olson-to-analysis",
+      "from": "olson",
+      "to": "analysis",
+      "label": "正演 / 灵敏度",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "fitting-to-analysis",
+      "from": "fitting",
+      "to": "analysis",
+      "label": "同步参数",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "op-to-fiber",
+      "from": "operator",
+      "to": "fiber-gui",
+      "label": "独立启动",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "fiber-to-models",
+      "from": "fiber-gui",
+      "to": "fiber-models",
+      "label": "Lu / 绝缘模型"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "入口",
+      "items": [
+        "主程序：python thermal_measurement_gui2.py",
+        "纤维丝：python xianwiesi/fiber_thermal_gui.py"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "薄膜 3ω",
+      "items": [
+        "锁相扫频写出 Excel/CSV",
+        "Olson 多层模型拟合 k_y、Rc、ψ 等",
+        "正向模拟、灵敏度、穿透深度共用层结构"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "纤维丝 3ω",
+      "items": [
+        "导电丝：Lu et al. 2001",
+        "绝缘丝：镀层加热/测温模型"
+      ]
+    }
+  ]
+}
