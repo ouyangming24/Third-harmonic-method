@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>3ω 法热导率测量流程图</title>
+  <style>
+    html, body { margin: 0; background: #e8e4db; }
+    .page {
+      width: 1600px;
+      height: 1000px;
+      margin: 0 auto;
+      background: #f7f4ee;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1560 960" width="1560" height="960">
+      <defs>
+        <marker id="arrowN" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="8.5" markerHeight="8.5" orient="auto">
+          <path d="M0 1.4 L11 6 L0 10.6 Z" fill="#1f3a5f"/>
+        </marker>
+        <marker id="arrowA" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="8.5" markerHeight="8.5" orient="auto">
+          <path d="M0 1.4 L11 6 L0 10.6 Z" fill="#b45309"/>
+        </marker>
+        <marker id="arrowT" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="8.5" markerHeight="8.5" orient="auto">
+          <path d="M0 1.4 L11 6 L0 10.6 Z" fill="#0f766e"/>
+        </marker>
+        <filter id="soft" x="-10%" y="-14%" width="120%" height="140%">
+          <feDropShadow dx="0" dy="1.4" stdDeviation="1.5" flood-color="#1f3a5f" flood-opacity="0.09"/>
+        </filter>
+      </defs>
+
+      <rect width="1560" height="960" fill="#f7f4ee"/>
+      <rect x="32" y="24" width="1496" height="912" rx="20" fill="#fcfbf8" stroke="#e6e0d4"/>
+
+      <text x="780" y="68" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="30" font-weight="700" fill="#10263d">3ω 法热导率测量流程图</text>
+      <text x="780" y="96" text-anchor="middle" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="14.5" fill="#667788">3ω Method  ·  Thermal Conductivity Measurement Setup</text>
+
+      <g filter="url(#soft)">
+        <rect x="292" y="128" width="236" height="82" rx="11" fill="#eef4ff" stroke="#1d4ed8" stroke-width="1.9"/>
+      </g>
+      <text x="410" y="162" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="16" font-weight="700" fill="#12304d">频率合成器</text>
+      <text x="410" y="184" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="12" fill="#5b6b7c">Frequency Synthesizer</text>
+
+      <g filter="url(#soft)">
+        <rect x="668" y="128" width="220" height="82" rx="11" fill="#fff7ed" stroke="#b45309" stroke-width="1.9"/>
+      </g>
+      <text x="778" y="162" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="16" font-weight="700" fill="#12304d">三倍频器</text>
+      <text x="778" y="184" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="12" fill="#5b6b7c">Frequency Tripler</text>
+
+      <g filter="url(#soft)">
+        <rect x="656" y="273" width="244" height="82" rx="11" fill="#f1f5f9" stroke="#334155" stroke-width="1.8"/>
+      </g>
+      <text x="778" y="307" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="16" font-weight="700" fill="#12304d">乘法 DAC</text>
+      <text x="778" y="329" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="12" fill="#5b6b7c">Multiplying DAC</text>
+
+      <g filter="url(#soft)">
+        <rect x="688" y="430" width="180" height="70" rx="11" fill="#f8fafc" stroke="#64748b" stroke-width="1.7"/>
+      </g>
+      <text x="778" y="460" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="16" font-weight="700" fill="#12304d">计算机</text>
+      <text x="778" y="480" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="12" fill="#5b6b7c">Computer</text>
+
+      <g filter="url(#soft)">
+        <rect x="1160" y="318" width="292" height="196" rx="14" fill="#ecfdf5" stroke="#0f766e" stroke-width="2.1"/>
+      </g>
+      <rect x="1172" y="388" width="118" height="112" rx="10" fill="#d1fae5" stroke="#0f766e" stroke-width="1.2"/>
+      <circle cx="1160" cy="348" r="5.2" fill="#fff7ed" stroke="#b45309" stroke-width="1.8"/>
+      <circle cx="1160" cy="418" r="5.2" fill="#ffffff" stroke="#1f3a5f" stroke-width="1.8"/>
+      <circle cx="1160" cy="472" r="5.2" fill="#ffffff" stroke="#0f766e" stroke-width="1.8"/>
+      <text x="1182" y="353" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="12" font-weight="700" fill="#b45309">REF</text>
+      <text x="1218" y="353" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="11.5" fill="#9a3412">3ω</text>
+      <text x="1231" y="450" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#0f766e">差分输入</text>
+      <text x="1388" y="412" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="17" font-weight="700" fill="#12304d">锁相放大器</text>
+      <text x="1388" y="438" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="12" fill="#5b6b7c">Lock-In Amplifier</text>
+
+      <path d="M350 210 H175 V250" fill="none" stroke="#1d4ed8" stroke-width="2.25"/>
+      <polyline points="175,250 175,258 157,272 193,288 157,304 193,320 157,336 193,352 175,366 175,378"
+                fill="none" stroke="#1d4ed8" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="175" cy="250" r="3.4" fill="#1d4ed8"/>
+      <circle cx="175" cy="378" r="3.4" fill="#1d4ed8"/>
+      <text x="36" y="304" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#3a5168">标准参考电阻</text>
+      <text x="36" y="324" font-family="Segoe UI, sans-serif" font-size="10.5" fill="#64748b">Std. Reference Resistor</text>
+
+      <line x1="175" y1="378" x2="175" y2="458" stroke="#0f766e" stroke-width="2.25"/>
+      <polyline points="175,458 175,466 157,480 193,496 157,512 193,528 157,544 193,560 175,574 175,588"
+                fill="none" stroke="#0f766e" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="175" cy="458" r="3.4" fill="#0f766e"/>
+      <circle cx="175" cy="588" r="3.4" fill="#0f766e"/>
+      <text x="36" y="508" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="13.5" font-weight="700" fill="#3a5168">样品</text>
+      <text x="36" y="528" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#3a5168">（加热器/温度计）</text>
+      <text x="36" y="548" font-family="Segoe UI, sans-serif" font-size="10.5" fill="#64748b">Sample</text>
+      <text x="36" y="564" font-family="Segoe UI, sans-serif" font-size="10.5" fill="#64748b">(Heater / Thermometer)</text>
+
+      <line x1="175" y1="588" x2="175" y2="612" stroke="#334155" stroke-width="2.2"/>
+      <line x1="149" y1="612" x2="201" y2="612" stroke="#334155" stroke-width="2.6" stroke-linecap="round"/>
+      <line x1="157" y1="621" x2="193" y2="621" stroke="#334155" stroke-width="2.2" stroke-linecap="round"/>
+      <line x1="165" y1="630" x2="185" y2="630" stroke="#334155" stroke-width="2" stroke-linecap="round"/>
+
+      <g filter="url(#soft)">
+        <polygon points="300,228 300,400 438,314" fill="#eef4ff" stroke="#1d4ed8" stroke-width="1.9"/>
+      </g>
+      <text x="346" y="306" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="15" font-weight="700" fill="#12304d">差分</text>
+      <text x="346" y="326" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="15" font-weight="700" fill="#12304d">放大</text>
+      <text x="350" y="346" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="11.5" fill="#5b6b7c">Diff Amp</text>
+      <line x1="175" y1="250" x2="300" y2="250" stroke="#1d4ed8" stroke-width="2.05"/>
+      <line x1="175" y1="378" x2="300" y2="378" stroke="#1d4ed8" stroke-width="2.05"/>
+      <text x="248" y="243" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="15" fill="#1d4ed8">+</text>
+      <text x="248" y="372" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="18" fill="#1d4ed8">−</text>
+
+      <g filter="url(#soft)">
+        <polygon points="300,436 300,610 438,523" fill="#ecfdf5" stroke="#0f766e" stroke-width="1.9"/>
+      </g>
+      <text x="346" y="514" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="15" font-weight="700" fill="#12304d">差分</text>
+      <text x="346" y="534" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="15" font-weight="700" fill="#12304d">放大</text>
+      <text x="350" y="554" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="11.5" fill="#5b6b7c">Diff Amp</text>
+      <line x1="175" y1="458" x2="300" y2="458" stroke="#0f766e" stroke-width="2.05"/>
+      <line x1="175" y1="588" x2="300" y2="588" stroke="#0f766e" stroke-width="2.05"/>
+      <text x="248" y="451" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="15" fill="#0f766e">+</text>
+      <text x="248" y="582" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="18" fill="#0f766e">−</text>
+
+      <line x1="528" y1="169" x2="662" y2="169" stroke="#b45309" stroke-width="2.2" marker-end="url(#arrowA)"/>
+      <text x="595" y="157" text-anchor="middle" font-family="Segoe UI, Cambria, serif" font-size="14" font-weight="700" fill="#b45309">ω</text>
+
+      <path d="M888 169 H1100 V348 H1148" fill="none" stroke="#b45309" stroke-width="2.2" marker-end="url(#arrowA)"/>
+      <text x="995" y="157" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#b45309">3ω 参考 / REF</text>
+
+      <line x1="438" y1="314" x2="650" y2="314" stroke="#1f3a5f" stroke-width="2.15" marker-end="url(#arrowN)"/>
+      <text x="544" y="302" text-anchor="middle" font-family="Segoe UI, Cambria, serif" font-size="13.5" font-weight="700" fill="#1f3a5f">V<tspan baseline-shift="sub" font-size="10">s</tspan>(ω)</text>
+
+      <line x1="778" y1="430" x2="778" y2="361" stroke="#64748b" stroke-width="2.05" marker-end="url(#arrowN)"/>
+      <text x="838" y="404" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="12" fill="#64748b">抵消系数</text>
+
+      <path d="M900 314 H1048 V418 H1148" fill="none" stroke="#1f3a5f" stroke-width="2.15" marker-end="url(#arrowN)"/>
+      <text x="1096" y="406" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#1f3a5f">抵消后 1ω</text>
+
+      <path d="M438 523 H520 V640 H1088 V472 H1148" fill="none" stroke="#0f766e" stroke-width="2.2" marker-end="url(#arrowT)"/>
+      <text x="620" y="628" text-anchor="middle" font-family="Segoe UI, Cambria, serif" font-size="13.5" font-weight="700" fill="#0f766e">V<tspan baseline-shift="sub" font-size="10">h</tspan>(ω, 3ω)</text>
+      <text x="1020" y="458" text-anchor="middle" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="12" font-weight="600" fill="#0f766e">3ω 电压</text>
+
+      <text x="248" y="202" text-anchor="middle" font-family="Segoe UI, Cambria, serif" font-size="13.5" font-weight="700" fill="#1d4ed8">I(ω)</text>
+
+      <rect x="72" y="668" width="1416" height="232" rx="14" fill="#f4f1ea" stroke="#e4ddd0"/>
+      <text x="100" y="704" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="15" font-weight="700" fill="#1f3348">信号路径说明</text>
+
+      <line x1="100" y1="734" x2="156" y2="734" stroke="#1d4ed8" stroke-width="3.4" stroke-linecap="round"/>
+      <text x="168" y="739" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="13.5" fill="#334155">激励：频率合成器输出角频率 ω 的交流电流，经标准参考电阻注入金属加热线。</text>
+
+      <line x1="100" y1="768" x2="156" y2="768" stroke="#b45309" stroke-width="3.4" stroke-linecap="round"/>
+      <text x="168" y="773" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="13.5" fill="#334155">参考：三倍频器将 ω 变换为 3ω，作为锁相放大器的参考信号。</text>
+
+      <line x1="100" y1="802" x2="156" y2="802" stroke="#1f3a5f" stroke-width="3.4" stroke-linecap="round"/>
+      <text x="168" y="807" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="13.5" fill="#334155">抵消：标准参考电阻电压经差分放大后进入乘法 DAC，由计算机设定系数，抵消大的 1ω 本底。</text>
+
+      <line x1="100" y1="836" x2="156" y2="836" stroke="#0f766e" stroke-width="3.4" stroke-linecap="round"/>
+      <text x="168" y="841" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="13.5" fill="#334155">检测：加热线电阻随 2ω 温度振荡，电压中出现 3ω 分量，由锁相放大器提取幅值与相位。</text>
+
+      <text x="100" y="872" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="12" fill="#7a8694">金属加热线同时作为加热器与电阻温度计；锁相放大器在 3ω 处读出信号，用于反演样品热导率。</text>
+    </svg>
+  </div>
+</body>
+</html>
